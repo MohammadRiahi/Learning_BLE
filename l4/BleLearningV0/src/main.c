@@ -47,7 +47,7 @@ static const struct bt_data ad[] = {
 };
 
 static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_ADVERTISING_VAL),
 };
 
 static void adv_work_handler(struct k_work *work)
