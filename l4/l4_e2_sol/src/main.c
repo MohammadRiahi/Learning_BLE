@@ -14,7 +14,7 @@
 #include "my_lbs.h"
 
 static const struct bt_le_adv_param *adv_param = BT_LE_ADV_PARAM(
-	(BT_LE_ADV_OPT_CONN |
+	(BT_LE_ADV_OPT_CONNECTABLE |
 	 BT_LE_ADV_OPT_USE_IDENTITY), /* Connectable advertising and use identity address */
 	800, /* Min Advertising Interval 500ms (800*0.625ms) */
 	801, /* Max Advertising Interval 500.625ms (801*0.625ms) */
@@ -66,11 +66,7 @@ static void advertising_start(void)
 {
 	k_work_submit(&adv_work);
 }
-static void recycled_cb(void)
-{
-	printk("Connection object available from previous conn. Disconnect is complete!\n");
-	advertising_start();
-}
+
 /* STEP 16 - Define a function to simulate the data */
 static void simulate_data(void)
 {
@@ -133,12 +129,14 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 	printk("Disconnected (reason %u)\n", reason);
 
 	dk_set_led_off(CON_STATUS_LED);
+	
+	/* Restart advertising after disconnection */
+	advertising_start();
 }
 
 struct bt_conn_cb connection_callbacks = {
 	.connected = on_connected,
 	.disconnected = on_disconnected,
-	.recycled = recycled_cb,
 };
 
 static int init_button(void)
