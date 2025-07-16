@@ -20,7 +20,7 @@ static const struct bt_le_adv_param *adv_param = BT_LE_ADV_PARAM(
 	801, /* Max Advertising Interval 500.625ms (801*0.625ms) */
 	NULL); /* Set to NULL for undirected advertising */
 
-LOG_MODULE_REGISTER(Lesson4_Exercise2, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(Lesson4_Exercise2, LOG_LEVEL_DBG);
 
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
@@ -48,7 +48,7 @@ static const struct bt_data ad[] = {
 };
 
 static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_PBM_ADVERTISING_VAL),
 };
 
 static void adv_work_handler(struct k_work *work)
@@ -108,7 +108,7 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
 	if (has_changed & USER_BUTTON) {
 		uint32_t user_button_state = button_state & USER_BUTTON;
 		/* STEP 6 - Send indication on a button press */
-		my_lbs_send_button_state_indicate(user_button_state);
+		//my_lbs_send_button_state_indicate(user_button_state);
 		app_button_state = user_button_state ? true : false;
 	}
 }
@@ -191,4 +191,4 @@ int main(void)
 	}
 }
 /* STEP 18.2 - Define and initialize a thread to send data periodically */
-K_THREAD_DEFINE(send_data_thread_id, STACKSIZE, send_data_thread, NULL, NULL, NULL, PRIORITY, 0, 0);
+//K_THREAD_DEFINE(send_data_thread_id, STACKSIZE, send_data_thread, NULL, NULL, NULL, PRIORITY, 0, 0);

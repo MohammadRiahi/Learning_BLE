@@ -31,6 +31,8 @@ LOG_MODULE_DECLARE(Lesson4_Exercise1);
 static bool button_state;
 static struct my_lbs_cb lbs_cb;
 
+uint8_t default_command[16] = {0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
 /* STEP 6 - Implement the write callback function of the LED characteristic */
 static ssize_t write_led(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
 			 uint16_t len, uint16_t offset, uint8_t flags)
