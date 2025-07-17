@@ -59,15 +59,16 @@ static void mylbsbc_ccc_DATA_cfg_changed(const struct bt_gatt_attr *attr, uint16
 static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
 			 uint16_t len, uint16_t offset, uint8_t flags)
 {
-	LOG_DBG("Command write, handle: %u, conn: %p", attr->handle, (void *)conn);
+	LOG_INF("=== WRITE_COMMANDS CALLED ===");
+	LOG_INF("Command write, handle: %u, conn: %p", attr->handle, (void *)conn);
 
 	if (len != 16U) {
-		LOG_DBG("Write command: Incorrect data length, expected 16 bytes, got %u", len);
+		LOG_INF("Write command: Incorrect data length, expected 16 bytes, got %u", len);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
 	if (offset != 0) {
-		LOG_DBG("Write command: Incorrect data offset");
+		LOG_INF("Write command: Incorrect data offset");
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
@@ -87,7 +88,7 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 			break;
 			
 		case CMD_READ_CONFIG:
-			LOG_DBG("Command: READ_CONFIG");
+			LOG_INF("Command: READ_CONFIG");
 			// Handle read config command
 			//LOG_DBG("Connected\n");
 			break;
@@ -140,12 +141,14 @@ BT_GATT_SERVICE_DEFINE(
 /* A function to register application callbacks for the LED and Button characteristics  */
 int my_lbs_init(struct my_lbs_cb *callbacks)
 {
+	LOG_INF("LBS service initialization started");
+	LOG_INF("Service has %d attributes", my_pbm_svc.attr_count);
 	LOG_DBG("Bluetooth initialized\n");
 	if (callbacks) {
 		lbs_cb.led_cb = callbacks->led_cb;
 		lbs_cb.button_cb = callbacks->button_cb;
 	}
-
+    LOG_INF("LBS service initialization completed");
 	return 0;
 }
 
