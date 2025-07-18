@@ -44,11 +44,11 @@ static uint32_t app_sensor_value = 100;
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
-
 };
 
 static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_PBM_ADVERTISING_VAL),
+	//BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_PBM_VAL),  // Main service only
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_PBM_ADVERTISING_VAL),  // Advertising service in scan response
 };
 
 static void adv_work_handler(struct k_work *work)
