@@ -59,9 +59,32 @@ static void mylbsbc_ccc_DATA_cfg_changed(const struct bt_gatt_attr *attr, uint16
 static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
 			 uint16_t len, uint16_t offset, uint8_t flags)
 {
+	// Make this VERY visible
+	printk("\n\n*** WRITE_COMMANDS FUNCTION CALLED ***\n");
+	printk("*** THIS SHOULD BE VERY VISIBLE ***\n\n");
+	
 	LOG_INF("=== WRITE_COMMANDS CALLED ===");
 	LOG_INF("Command write, handle: %u, conn: %p", attr->handle, (void *)conn);
 
+	LOG_INF("Data length: %u bytes", len);
+	// -----------------------------------------------------------
+	// Log the raw bytes received
+	const uint8_t *data = (const uint8_t *)buf;
+	LOG_INF("Raw data received:");
+	for (int i = 0; i < len; i++) {
+		printk("%02x", data[i]);
+	}
+	printk("\n");
+	
+	// Also log as hex string for easy comparison
+	char hex_str[64];
+	for (int i = 0; i < len && i < 16; i++) {
+		sprintf(&hex_str[i*2], "%02x", data[i]);
+	}
+	hex_str[len*2] = '\0';
+	LOG_INF("Hex string: %s", hex_str);
+	LOG_INF("Expected:   00040100000001030000000000000000");
+// -----------------------------------------------------------
 	if (len != 16U) {
 		LOG_INF("Write command: Incorrect data length, expected 16 bytes, got %u", len);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
@@ -143,12 +166,20 @@ int my_lbs_init(struct my_lbs_cb *callbacks)
 {
 	LOG_INF("LBS service initialization started");
 	LOG_INF("Service has %d attributes", my_pbm_svc.attr_count);
-	LOG_DBG("Bluetooth initialized\n");
+	
+	// Print all attributes to verify service structure
+	for (int i = 0; i < my_pbm_svc.attr_count; i++) {
+		LOG_INF("Attr[%d]: UUID type %d, read=%p, write=%p", 
+			i, my_pbm_svc.attrs[i].uuid->type, 
+			(void*)my_pbm_svc.attrs[i].read, 
+			(void*)my_pbm_svc.attrs[i].write);
+	}
+	
 	if (callbacks) {
 		lbs_cb.led_cb = callbacks->led_cb;
 		lbs_cb.button_cb = callbacks->button_cb;
 	}
-    LOG_INF("LBS service initialization completed");
+	LOG_INF("LBS service initialization completed");
 	return 0;
 }
 
