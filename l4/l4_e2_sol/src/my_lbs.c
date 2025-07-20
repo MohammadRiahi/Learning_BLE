@@ -154,18 +154,27 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 /* PIBiomed (PBM)  Service Declaration */
 BT_GATT_SERVICE_DEFINE(
 	my_pbm_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_PBM),
-	BT_GATT_CHARACTERISTIC(BT_UUID_PBM_COMMAND, BT_GATT_CHRC_WRITE |BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_WRITE, NULL, write_commands, &command_buffer),
+	
+	// Command Characteristic with descriptive name
+	BT_GATT_CHARACTERISTIC(BT_UUID_PBM_COMMAND, BT_GATT_CHRC_WRITE |BT_GATT_CHRC_READ , BT_GATT_PERM_WRITE, NULL, write_commands, &command_buffer),
+	BT_GATT_DESCRIPTOR(BT_UUID_GATT_CUD, BT_GATT_PERM_READ, NULL, NULL, "COMMAND"),
+	
+	// Data Characteristic with descriptive name
 	BT_GATT_CHARACTERISTIC(BT_UUID_PBM_DATA, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_NONE, NULL, NULL, NULL),
+	BT_GATT_DESCRIPTOR(BT_UUID_GATT_CUD, BT_GATT_PERM_READ, NULL, NULL, "DATA"),
 	BT_GATT_CCC(mylbsbc_ccc_DATA_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	
+	// Message Characteristic with descriptive name
 	BT_GATT_CHARACTERISTIC(BT_UUID_PBM_MESSAGE, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_NONE, NULL, NULL, NULL),
+	BT_GATT_DESCRIPTOR(BT_UUID_GATT_CUD, BT_GATT_PERM_READ, NULL, NULL, "MESSAGE"),
 	BT_GATT_CCC(mylbsbc_ccc_message_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
 
-/* Advertising Service Declaration - No characteristics, just service UUID */
+/* Advertising Service Declaration - No characteristics, just service UUID 
 BT_GATT_SERVICE_DEFINE(
 	my_advertising_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_PBM_ADVERTISING),
 );
-
+*/
 /* A function to register application callbacks for the LED and Button characteristics  */
 int my_lbs_init(struct my_lbs_cb *callbacks)
 {

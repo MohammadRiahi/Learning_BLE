@@ -52,6 +52,7 @@ static const struct bt_data sd[] = {
 };
 
 static void adv_work_handler(struct k_work *work)
+ 
 {
 	int err = bt_le_adv_start(adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 
