@@ -218,5 +218,18 @@ int my_lbs_send_sensor_notify(uint32_t sensor_value)
 		return -EACCES;
 	}
 
-	return bt_gatt_notify(NULL, &my_pbm_svc.attrs[7], &sensor_value, sizeof(sensor_value));
+	// The DATA characteristic value attribute is at index 4:
+	// [0] Primary Service
+	// [1] COMMAND Characteristic Declaration
+	// [2] COMMAND Characteristic Value
+	// [3] COMMAND CUD Descriptor
+	// [4] DATA Characteristic Declaration
+	// [5] DATA Characteristic Value
+	// [6] DATA CUD Descriptor
+	// [7] DATA CCC Descriptor
+	// [8] MESSAGE Characteristic Declaration
+	// [9] MESSAGE Characteristic Value
+	// [10] MESSAGE CUD Descriptor
+	// [11] MESSAGE CCC Descriptor
+	return bt_gatt_notify(NULL, &my_pbm_svc.attrs[5], &sensor_value, sizeof(sensor_value));
 }
