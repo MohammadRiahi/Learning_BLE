@@ -20,27 +20,29 @@ extern "C" {
 #include <zephyr/types.h>
 
 /** @brief PBM Service and Advertising UUID. */
-#define BT_UUID_PBM_VAL                BT_UUID_128_ENCODE(0x0000525F, 0x45D0, 0x4AA9, 0xBD0A, 0x93D9E09A7CFC)
+#define BT_UUID_PBM_VAL                BT_UUID_128_ENCODE(0x0000525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
 #define BT_UUID_PBM_ADVERTISING_VAL    BT_UUID_128_ENCODE(0x000062C4, 0xB99E, 0x4141, 0x9439, 0xC4F9DB977899)
-
+                                                          
 /** @brief COMMAND Characteristic UUID. */
-#define BT_UUID_PBM_COMMAND_VAL                                                                     \
-	BT_UUID_128_ENCODE(0x0100525F, 0x45D0, 0x4AA9, 0xBD0A, 0x93D9E09A7CFC)
+#define BT_UUID_PBM_COMMAND_VAL                                                       \
+	BT_UUID_128_ENCODE(0x0100525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
 
 /** @brief MESSAGE Characteristic UUID. */
-#define BT_UUID_PBM_MESSAGE_VAL BT_UUID_128_ENCODE(0x0300525F, 0x45D0, 0x4AA9, 0xBD0A, 0x93D9E09A7CFC)
+#define BT_UUID_PBM_MESSAGE_VAL BT_UUID_128_ENCODE(0x0300525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
 
-/* STEP 11.1 - Assign a UUID to the MYSENSOR characteristic */
-/** @brief LED Characteristic UUID. */
+/** @brief DATA Characteristic UUID. */
 #define BT_UUID_PBM_DATA_VAL                                                 \
-	BT_UUID_128_ENCODE(0x0200525F, 0x45D0, 0x4AA9, 0xBD0A, 0x93D9E09A7CFC)
+	BT_UUID_128_ENCODE(0x0200525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
+
+	/** @brief HeartBeat Characteristic UUID. */
+#define BT_UUID_PBM_HEARTBEAT_VAL    BT_UUID_128_ENCODE(0x0400525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
 
 #define BT_UUID_PBM_ADVERTISING  BT_UUID_DECLARE_128(BT_UUID_PBM_ADVERTISING_VAL)
 #define BT_UUID_PBM              BT_UUID_DECLARE_128(BT_UUID_PBM_VAL)
 #define BT_UUID_PBM_COMMAND      BT_UUID_DECLARE_128(BT_UUID_PBM_COMMAND_VAL)
 #define BT_UUID_PBM_MESSAGE      BT_UUID_DECLARE_128(BT_UUID_PBM_MESSAGE_VAL)
 #define BT_UUID_PBM_DATA         BT_UUID_DECLARE_128(BT_UUID_PBM_DATA_VAL)
-
+#define BT_UUID_PBM_HEARTBEAT    BT_UUID_DECLARE_128(BT_UUID_PBM_HEARTBEAT_VAL)
 /** @brief Callback type for when an LED state change is received. */
 typedef void (*led_cb_t)(const bool led_state);
 
