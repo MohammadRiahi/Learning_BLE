@@ -29,6 +29,22 @@ LOG_MODULE_DECLARE(Lesson4_Exercise2);
 
 /* Forward declaration of the GATT service */
 extern const struct bt_gatt_service_static my_pbm_svc;
+// Sampling parameters 
+volatile uint8_t averaging  = 1;
+volatile uint32_t samplingRate = 1000;
+
+/* Helper function to decode sample rate from code */
+static uint32_t decodeSampleRate(uint8_t code) {
+    switch (code) {
+        case 0: return 100;
+        case 1: return 250;
+        case 2: return 500;
+        case 3: return 1000;
+        case 4: return 2000;
+        case 5: return 4000;
+        default: return 1000;  // default fallback
+    }
+}
 
 static bool notify_DATA_enabled;
 static bool notify_MESSAGE_enabled;
@@ -58,6 +74,8 @@ static void mylbsbc_ccc_message_cfg_changed(const struct bt_gatt_attr *attr, uin
 static void mylbsbc_ccc_DATA_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	notify_DATA_enabled = (value == BT_GATT_CCC_NOTIFY);
+	LOG_INF("DATA CCCD changed: %u, notifications %s", value, 
+		notify_DATA_enabled ? "enabled" : "disabled");
 }
 
 static ssize_t write_heartbeat(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
@@ -75,7 +93,8 @@ static ssize_t write_heartbeat(struct bt_conn *conn, const struct bt_gatt_attr *
 
 	// Here you can handle the heartbeat value as needed
 	// For now, we'll just log it
-
+    
+   //LOG_INF("Heartbeat ignored for testing");
 	return len;
 }
 static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
@@ -184,7 +203,57 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 			
 		case CMD_SET_CONFIG:
 			LOG_INF("Command: SET_CONFIG");
-			// Handle set config command
+			default_command[0] = 0;
+			default_command[1] = CMD_SET_CONFIG;
+			default_command[2] = command_buffer[2];
+			// Clear bytes 3-6 (4 bytes) 
+			memset(&default_command[3], 0, 4);
+			default_command[7] = command_buffer[7];  // Sample Rate
+			samplingRate = decodeSampleRate(default_command[7]);  // Decode sampling rate
+			averaging = command_buffer[8];  // Set averaging parameter
+			default_command[8] = averaging;
+			default_command[9] = command_buffer[9];  // Set averaging parameter
+			memset(&default_command[10], 0, 6); // Clear bytes 9-15
+			
+			current_timestamp = k_uptime_get_32();
+			snprintf(message_buffer, sizeof(message_buffer),
+				"{\"ts\":%u,\"Config read\":[%d,%d,%d,%d,%d,%d,%d,%d,%d]}",
+				current_timestamp,
+				default_command[2], default_command[3], default_command[4], default_command[7],
+				default_command[8], default_command[9], default_command[10], default_command[11],
+				default_command[12]);		
+				LOG_INF("JSON message created: %s", message_buffer);
+			
+			// Check if MESSAGE notifications are enabled
+			if (!notify_MESSAGE_enabled) {
+				LOG_WRN("MESSAGE notifications not enabled by client");
+				// Still return success as the command was processed
+			} else {
+				// Send notification through MESSAGE characteristic
+				// The MESSAGE characteristic value attribute is at index 9 in the service
+				LOG_INF("Attempting to send notification, message length: %d", strlen(message_buffer));
+				int result = bt_gatt_notify(NULL, &my_pbm_svc.attrs[9], message_buffer, strlen(message_buffer));
+				if (result == 0) {
+					LOG_INF("Message notification sent successfully");
+				} else {
+					LOG_ERR("Failed to send message notification: %d", result);
+					// Add specific error descriptions
+					switch (result) {
+						case -ENOMEM:
+							LOG_ERR("No memory/buffer available for notification");
+							break;
+						case -ENOTCONN:
+							LOG_ERR("Device not connected");
+							break;
+						case -EINVAL:
+							LOG_ERR("Invalid parameters");
+							break;
+						default:
+							LOG_ERR("Unknown error code: %d", result);
+							break;
+					}
+				}
+			}
 			break;
 			
 		case CMD_STOP_MEASUREMENT:
