@@ -1,0 +1,300 @@
+/*
+ * Copyright (c) 2025 Your Organization
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+#ifndef MY_LBS_H_
+#define MY_LBS_H_
+
+/**@file
+ * @defgroup my_lbs Custom BLE Service API
+ * @{
+ * @brief API for the custom BLE service with ADC/DAC functionality.
+ */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <zephyr/types.h>
+#include <stdint.h>
+
+/*===========================================================================*/
+/*                              UUID DEFINITIONS                            */
+/*===========================================================================*/
+
+/** @brief PBM Service and Advertising UUID. */
+#define BT_UUID_PBM_VAL                BT_UUID_128_ENCODE(0x0000525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
+#define BT_UUID_PBM_ADVERTISING_VAL    BT_UUID_128_ENCODE(0x000062C4, 0xB99E, 0x4141, 0x9439, 0xC4F9DB977899)
+
+/** @brief COMMAND Characteristic UUID. */
+#define BT_UUID_PBM_COMMAND_VAL        BT_UUID_128_ENCODE(0x0100525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
+
+/** @brief MESSAGE Characteristic UUID. */
+#define BT_UUID_PBM_MESSAGE_VAL        BT_UUID_128_ENCODE(0x0300525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
+
+/** @brief DATA Characteristic UUID. */
+#define BT_UUID_PBM_DATA_VAL           BT_UUID_128_ENCODE(0x0200525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
+
+/** @brief HeartBeat Characteristic UUID. */
+#define BT_UUID_PBM_HEARTBEAT_VAL      BT_UUID_128_ENCODE(0x0400525F, 0x45D0, 0x4AA9, 0xDB0A, 0x93D9E09A7CFC)
+
+/* UUID Declarations */
+#define BT_UUID_PBM_ADVERTISING        BT_UUID_DECLARE_128(BT_UUID_PBM_ADVERTISING_VAL)
+#define BT_UUID_PBM                    BT_UUID_DECLARE_128(BT_UUID_PBM_VAL)
+#define BT_UUID_PBM_COMMAND            BT_UUID_DECLARE_128(BT_UUID_PBM_COMMAND_VAL)
+#define BT_UUID_PBM_MESSAGE            BT_UUID_DECLARE_128(BT_UUID_PBM_MESSAGE_VAL)
+#define BT_UUID_PBM_DATA               BT_UUID_DECLARE_128(BT_UUID_PBM_DATA_VAL)
+#define BT_UUID_PBM_HEARTBEAT          BT_UUID_DECLARE_128(BT_UUID_PBM_HEARTBEAT_VAL)
+
+/*===========================================================================*/
+/*                              CONSTANTS                                   */
+/*===========================================================================*/
+
+/** @brief Command packet size in bytes */
+#define COMMAND_PACKET_SIZE            16
+
+/** @brief Maximum number of ADC samples per acquisition */
+#define MAX_ADC_SAMPLES                1024
+
+/** @brief DAC resolution in bits */
+#define DAC_RESOLUTION_BITS            12
+
+/** @brief Maximum DAC value */
+#define DAC_MAX_VALUE                  ((1 << DAC_RESOLUTION_BITS) - 1)
+
+/*===========================================================================*/
+/*                              ENUMERATIONS                                */
+/*===========================================================================*/
+
+/** @brief Command types supported by the service */
+enum command_type {
+    CMD_STOP_ALL            = 0x00,  /**< Stop all operations */
+    CMD_BATTERY_CHECK       = 0x01,  /**< Read battery voltage once */
+    CMD_READ_CONFIG         = 0x04,  /**< Read current configuration */
+    CMD_SET_CONFIG          = 0x05,  /**< Set new configuration */
+    CMD_START_SINGLE        = 0x10,  /**< Start single measurement */
+    CMD_START_CONTINUOUS    = 0x11,  /**< Start continuous measurement */
+    CMD_STOP_MEASUREMENT    = 0x12   /**< Stop current measurement */
+};
+
+/** @brief ADC channel selection masks */
+enum adc_channel_mask {
+    ADC_CHANNEL_0           = 0x01,  /**< ADC Channel 0 */
+    ADC_CHANNEL_1           = 0x02,  /**< ADC Channel 1 */
+    ADC_CHANNEL_2           = 0x04,  /**< ADC Channel 2 */
+    ADC_CHANNEL_3           = 0x08   /**< ADC Channel 3 */
+};
+
+/** @brief Measurement states */
+enum measurement_state {
+    MEASUREMENT_IDLE        = 0,     /**< No measurement active */
+    MEASUREMENT_SINGLE      = 1,     /**< Single measurement active */
+    MEASUREMENT_CONTINUOUS  = 2      /**< Continuous measurement active */
+};
+
+/*===========================================================================*/
+/*                              STRUCTURES                                  */
+/*===========================================================================*/
+
+/** @brief Command packet structure for parsing BLE commands */
+struct command_packet {
+    uint8_t command;                 /**< Command type (byte 0) */
+    uint8_t reserved1;               /**< Reserved byte 1 */
+    uint8_t adc_channel_mask;        /**< ADC channel selection (byte 2) */
+    uint8_t reserved3;               /**< Reserved byte 3 */
+    uint8_t reserved4;               /**< Reserved byte 4 */
+    uint16_t pulse_width;            /**< DAC pulse width (bytes 5-6, little endian) */
+    uint8_t reserved7;               /**< Reserved byte 7 */
+    uint16_t sample_count;           /**< Number of samples (bytes 8-9, little endian) */
+    uint16_t repetition_freq;        /**< Repetition frequency in Hz (bytes 10-11, little endian) */
+    uint8_t reserved[4];             /**< Reserved bytes 12-15 */
+} __packed;
+
+/** @brief ADC measurement configuration */
+struct adc_config {
+    uint8_t channel;                 /**< Selected ADC channel (0-3) */
+    uint16_t sample_count;           /**< Number of samples to acquire */
+    uint16_t sample_rate;            /**< Sampling rate in Hz */
+};
+
+/** @brief DAC pulse configuration */
+struct dac_config {
+    uint16_t pulse_width_us;         /**< Pulse width in microseconds */
+    uint16_t amplitude;              /**< Pulse amplitude (0-4095 for 12-bit DAC) */
+};
+
+/** @brief Measurement configuration combining ADC and DAC settings */
+struct measurement_config {
+    struct adc_config adc;           /**< ADC configuration */
+    struct dac_config dac;           /**< DAC configuration */
+    uint16_t repetition_period_ms;   /**< Period between measurements (continuous mode) */
+    enum measurement_state state;    /**< Current measurement state */
+};
+
+/*===========================================================================*/
+/*                              CALLBACKS                                   */
+/*===========================================================================*/
+
+/** @brief Callback type for LED state changes */
+typedef void (*led_cb_t)(const bool led_state);
+
+/** @brief Callback type for button state reading */
+typedef bool (*button_cb_t)(void);
+
+/** @brief Callback type for command processing */
+typedef int (*command_cb_t)(const struct command_packet *cmd);
+
+/** @brief Callback type for measurement completion */
+typedef void (*measurement_complete_cb_t)(const uint16_t *data, size_t length);
+
+/** @brief Callback type for error reporting */
+typedef void (*error_cb_t)(int error_code, const char *error_msg);
+
+/** @brief Service callback structure */
+struct my_lbs_cb {
+    led_cb_t led_cb;                           /**< LED state change callback */
+    button_cb_t button_cb;                     /**< Button read callback */
+    command_cb_t command_cb;                   /**< Command processing callback */
+    measurement_complete_cb_t measurement_cb;  /**< Measurement completion callback */
+    error_cb_t error_cb;                       /**< Error reporting callback */
+};
+
+/*===========================================================================*/
+/*                              FUNCTION DECLARATIONS                       */
+/*===========================================================================*/
+
+/** @brief Initialize the custom BLE service.
+ *
+ * This function initializes the BLE service and registers callback functions.
+ *
+ * @param[in] callbacks Pointer to callback structure. Can be NULL.
+ *
+ * @retval 0 Success
+ * @retval -EINVAL Invalid parameters
+ * @retval -ENOMEM Insufficient memory
+ */
+int my_lbs_init(struct my_lbs_cb *callbacks);
+
+/** @brief Send button state as indication.
+ *
+ * @param[in] button_state The current button state
+ *
+ * @retval 0 Success
+ * @retval -ENOTCONN No connected peers
+ * @retval -ENOMEM Insufficient memory for indication
+ */
+int my_lbs_send_button_state_indicate(bool button_state);
+
+/** @brief Send button state as notification.
+ *
+ * @param[in] button_state The current button state
+ *
+ * @retval 0 Success
+ * @retval -ENOTCONN No connected peers
+ * @retval -ENOMEM Insufficient memory for notification
+ */
+int my_lbs_send_button_state_notify(bool button_state);
+
+/** @brief Send sensor data as notification.
+ *
+ * @param[in] sensor_value The sensor reading
+ *
+ * @retval 0 Success
+ * @retval -ENOTCONN No connected peers
+ * @retval -ENOMEM Insufficient memory for notification
+ */
+int my_lbs_send_sensor_notify(uint32_t sensor_value);
+
+/** @brief Send ADC data array as notification.
+ *
+ * This function sends acquired ADC data through the DATA characteristic.
+ *
+ * @param[in] data Pointer to ADC data array
+ * @param[in] length Number of samples in the array
+ *
+ * @retval 0 Success
+ * @retval -EINVAL Invalid parameters
+ * @retval -ENOTCONN No connected peers
+ * @retval -ENOMEM Insufficient memory for notification
+ */
+int my_lbs_send_adc_data_notify(const uint16_t *data, size_t length);
+
+/** @brief Process received command.
+ *
+ * This function parses and executes commands received via the COMMAND characteristic.
+ *
+ * @param[in] data Raw command data
+ * @param[in] length Length of command data (should be COMMAND_PACKET_SIZE)
+ *
+ * @retval 0 Success
+ * @retval -EINVAL Invalid command or parameters
+ * @retval -EBUSY Operation already in progress
+ * @retval -EIO Hardware error
+ */
+int my_lbs_process_command(const uint8_t *data, size_t length);
+
+/** @brief Start single ADC measurement with DAC pulse.
+ *
+ * @param[in] config Measurement configuration
+ *
+ * @retval 0 Success
+ * @retval -EINVAL Invalid configuration
+ * @retval -EBUSY Measurement already in progress
+ * @retval -EIO Hardware initialization failed
+ */
+int my_lbs_start_single_measurement(const struct measurement_config *config);
+
+/** @brief Start continuous ADC measurements with DAC pulses.
+ *
+ * @param[in] config Measurement configuration
+ *
+ * @retval 0 Success
+ * @retval -EINVAL Invalid configuration
+ * @retval -EBUSY Measurement already in progress
+ * @retval -EIO Hardware initialization failed
+ */
+int my_lbs_start_continuous_measurement(const struct measurement_config *config);
+
+/** @brief Stop current measurement operation.
+ *
+ * @retval 0 Success
+ * @retval -EALREADY No measurement in progress
+ */
+int my_lbs_stop_measurement(void);
+
+/** @brief Read battery voltage once.
+ *
+ * @param[out] voltage_mv Battery voltage in millivolts
+ *
+ * @retval 0 Success
+ * @retval -EINVAL Invalid parameter
+ * @retval -EIO ADC read failed
+ */
+int my_lbs_read_battery_voltage(uint16_t *voltage_mv);
+
+/** @brief Get current measurement state.
+ *
+ * @return Current measurement state
+ */
+enum measurement_state my_lbs_get_measurement_state(void);
+
+/** @brief Parse ADC channel from channel mask.
+ *
+ * @param[in] channel_mask Channel selection mask
+ *
+ * @retval 0-3 Valid ADC channel number
+ * @retval -EINVAL Invalid or multiple channels selected
+ */
+int my_lbs_parse_adc_channel(uint8_t channel_mask);
+
+#ifdef __cplusplus
+}
+#endif
+
+/**
+ * @}
+ */
+
+#endif /* MY_LBS_H_ */

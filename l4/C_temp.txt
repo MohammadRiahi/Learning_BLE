@@ -1,0 +1,746 @@
+/*
+ * Copyright (c) 2025 Your Organization
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/gpio.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+
+#include "my_lbs.h"
+
+LOG_MODULE_REGISTER(my_lbs, CONFIG_BT_LBS_LOG_LEVEL);
+
+/*===========================================================================*/
+/*                              CONSTANTS                                   */
+/*===========================================================================*/
+
+#define DAC_I2C_ADDRESS         0x62    /* MCP4725 typical address */
+#define ADC_RESOLUTION          12      /* 12-bit ADC resolution */
+#define ADC_REFERENCE_MV        3300    /* 3.3V reference voltage */
+#define BATTERY_VOLTAGE_CHANNEL 0       /* ADC channel for battery monitoring */
+
+/* Work queue timing */
+#define MEASUREMENT_STACK_SIZE  1024
+#define MEASUREMENT_PRIORITY    5
+
+/*===========================================================================*/
+/*                              GLOBAL VARIABLES                            */
+/*===========================================================================*/
+
+/* Service callbacks */
+static struct my_lbs_cb service_callbacks = {0};
+
+/* Current measurement configuration and state */
+static struct measurement_config current_config = {0};
+static enum measurement_state measurement_state = MEASUREMENT_IDLE;
+
+/* Hardware device references */
+static const struct device *adc_dev;
+static const struct device *i2c_dev;
+
+/* ADC configuration */
+static struct adc_channel_cfg adc_channel_configs[4];
+static struct adc_sequence adc_sequence = {0};
+static int16_t adc_sample_buffer[MAX_ADC_SAMPLES];
+
+/* Work items for measurements */
+static struct k_work_delayable continuous_measurement_work;
+static struct k_work single_measurement_work;
+
+/* Connection reference */
+static struct bt_conn *current_conn;
+
+/* Default command array definition (moved from header) */
+uint8_t default_command[COMMAND_PACKET_SIZE] = {0};
+
+/*===========================================================================*/
+/*                              STATIC FUNCTIONS                            */
+/*===========================================================================*/
+
+static ssize_t read_command_characteristic(struct bt_conn *conn,
+                                         const struct bt_gatt_attr *attr,
+                                         void *buf, uint16_t len, uint16_t offset);
+
+static ssize_t write_command_characteristic(struct bt_conn *conn,
+                                          const struct bt_gatt_attr *attr,
+                                          const void *buf, uint16_t len,
+                                          uint16_t offset, uint8_t flags);
+
+static void ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
+
+static int dac_write_value(uint16_t value);
+static int adc_read_channel(uint8_t channel, uint16_t *result);
+static int adc_read_multiple_samples(uint8_t channel, uint16_t *buffer, 
+                                   size_t count, uint16_t sample_rate);
+
+static void single_measurement_work_handler(struct k_work *work);
+static void continuous_measurement_work_handler(struct k_work *work);
+
+static int parse_command_packet(const uint8_t *data, size_t length, 
+                               struct command_packet *cmd);
+static int validate_measurement_config(const struct measurement_config *config);
+
+/*===========================================================================*/
+/*                              GATT SERVICE DEFINITION                     */
+/*===========================================================================*/
+
+BT_GATT_SERVICE_DEFINE(my_lbs_svc,
+    BT_GATT_PRIMARY_SERVICE(BT_UUID_PBM),
+    
+    /* Command Characteristic */
+    BT_GATT_CHARACTERISTIC(BT_UUID_PBM_COMMAND,
+                          BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+                          BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
+                          read_command_characteristic,
+                          write_command_characteristic,
+                          &default_command),
+    
+    /* Data Characteristic */
+    BT_GATT_CHARACTERISTIC(BT_UUID_PBM_DATA,
+                          BT_GATT_CHRC_NOTIFY,
+                          BT_GATT_PERM_NONE,
+                          NULL, NULL, NULL),
+    BT_GATT_CCC(ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    
+    /* Message Characteristic */
+    BT_GATT_CHARACTERISTIC(BT_UUID_PBM_MESSAGE,
+                          BT_GATT_CHRC_NOTIFY,
+                          BT_GATT_PERM_NONE,
+                          NULL, NULL, NULL),
+    BT_GATT_CCC(ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    
+    /* HeartBeat Characteristic */
+    BT_GATT_CHARACTERISTIC(BT_UUID_PBM_HEARTBEAT,
+                          BT_GATT_CHRC_NOTIFY,
+                          BT_GATT_PERM_NONE,
+                          NULL, NULL, NULL),
+    BT_GATT_CCC(ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+);
+
+/*===========================================================================*/
+/*                              BLE CHARACTERISTIC HANDLERS                 */
+/*===========================================================================*/
+
+static ssize_t read_command_characteristic(struct bt_conn *conn,
+                                         const struct bt_gatt_attr *attr,
+                                         void *buf, uint16_t len, uint16_t offset)
+{
+    LOG_DBG("Command characteristic read, offset %d, length %d", offset, len);
+    
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, 
+                            default_command, sizeof(default_command));
+}
+
+static ssize_t write_command_characteristic(struct bt_conn *conn,
+                                          const struct bt_gatt_attr *attr,
+                                          const void *buf, uint16_t len,
+                                          uint16_t offset, uint8_t flags)
+{
+    LOG_DBG("Command characteristic write, offset %d, length %d", offset, len);
+    
+    if (offset != 0) {
+        LOG_WRN("Command write with non-zero offset not supported");
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+    }
+    
+    if (len != COMMAND_PACKET_SIZE) {
+        LOG_ERR("Invalid command packet size: %d, expected %d", 
+                len, COMMAND_PACKET_SIZE);
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    }
+    
+    /* Store the command and process it */
+    memcpy(default_command, buf, len);
+    
+    int ret = my_lbs_process_command((const uint8_t *)buf, len);
+    if (ret < 0) {
+        LOG_ERR("Command processing failed: %d", ret);
+        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+    }
+    
+    return len;
+}
+
+static void ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    LOG_DBG("CCC configuration changed: 0x%04x", value);
+}
+
+/*===========================================================================*/
+/*                              HARDWARE INTERFACE                          */
+/*===========================================================================*/
+
+static int dac_write_value(uint16_t value)
+{
+    if (!i2c_dev) {
+        LOG_ERR("I2C device not initialized");
+        return -ENODEV;
+    }
+    
+    /* Clamp value to 12-bit range */
+    if (value > DAC_MAX_VALUE) {
+        value = DAC_MAX_VALUE;
+    }
+    
+    /* MCP4725 command format: [0x40][upper 4 bits][lower 8 bits] */
+    uint8_t data[3] = {
+        0x40,                    /* Fast mode command */
+        (value >> 8) & 0x0F,     /* Upper 4 bits */
+        value & 0xFF             /* Lower 8 bits */
+    };
+    
+    int ret = i2c_write(i2c_dev, data, sizeof(data), DAC_I2C_ADDRESS);
+    if (ret < 0) {
+        LOG_ERR("DAC write failed: %d", ret);
+        return ret;
+    }
+    
+    LOG_DBG("DAC value set to %d", value);
+    return 0;
+}
+
+static int adc_read_channel(uint8_t channel, uint16_t *result)
+{
+    if (!adc_dev || channel >= 4) {
+        return -EINVAL;
+    }
+    
+    int16_t sample;
+    adc_sequence.channels = BIT(channel);
+    adc_sequence.buffer = &sample;
+    adc_sequence.buffer_size = sizeof(sample);
+    
+    int ret = adc_read(adc_dev, &adc_sequence);
+    if (ret < 0) {
+        LOG_ERR("ADC read failed: %d", ret);
+        return ret;
+    }
+    
+    /* Convert to positive value */
+    *result = sample >= 0 ? sample : 0;
+    
+    LOG_DBG("ADC channel %d read: %d", channel, *result);
+    return 0;
+}
+
+static int adc_read_multiple_samples(uint8_t channel, uint16_t *buffer, 
+                                   size_t count, uint16_t sample_rate)
+{
+    if (!adc_dev || channel >= 4 || !buffer || count == 0 || count > MAX_ADC_SAMPLES) {
+        return -EINVAL;
+    }
+    
+    /* Calculate delay between samples */
+    uint32_t delay_us = (1000000 / sample_rate);
+    
+    for (size_t i = 0; i < count; i++) {
+        int ret = adc_read_channel(channel, &buffer[i]);
+        if (ret < 0) {
+            LOG_ERR("Sample %d read failed: %d", i, ret);
+            return ret;
+        }
+        
+        if (i < count - 1) {
+            k_usleep(delay_us);
+        }
+    }
+    
+    LOG_DBG("Read %d samples from channel %d", count, channel);
+    return 0;
+}
+
+/*===========================================================================*/
+/*                              WORK HANDLERS                               */
+/*===========================================================================*/
+
+static void single_measurement_work_handler(struct k_work *work)
+{
+    LOG_DBG("Starting single measurement");
+    
+    if (measurement_state != MEASUREMENT_SINGLE) {
+        LOG_WRN("Single measurement work called but state is not SINGLE");
+        return;
+    }
+    
+    /* Configure and trigger DAC pulse */
+    uint16_t dac_value = (current_config.dac.amplitude * DAC_MAX_VALUE) / 100;
+    int ret = dac_write_value(dac_value);
+    if (ret < 0) {
+        LOG_ERR("DAC configuration failed: %d", ret);
+        goto error;
+    }
+    
+    /* Wait for pulse width duration */
+    k_usleep(current_config.dac.pulse_width_us);
+    
+    /* Turn off DAC */
+    dac_write_value(0);
+    
+    /* Read ADC samples */
+    uint16_t *sample_buffer = k_malloc(current_config.adc.sample_count * sizeof(uint16_t));
+    if (!sample_buffer) {
+        LOG_ERR("Failed to allocate sample buffer");
+        ret = -ENOMEM;
+        goto error;
+    }
+    
+    ret = adc_read_multiple_samples(current_config.adc.channel,
+                                  sample_buffer,
+                                  current_config.adc.sample_count,
+                                  current_config.adc.sample_rate);
+    if (ret < 0) {
+        LOG_ERR("ADC sampling failed: %d", ret);
+        k_free(sample_buffer);
+        goto error;
+    }
+    
+    /* Send data via BLE notification */
+    ret = my_lbs_send_adc_data_notify(sample_buffer, current_config.adc.sample_count);
+    if (ret < 0) {
+        LOG_ERR("Data notification failed: %d", ret);
+    }
+    
+    k_free(sample_buffer);
+    
+    /* Measurement complete */
+    measurement_state = MEASUREMENT_IDLE;
+    
+    if (service_callbacks.measurement_cb) {
+        service_callbacks.measurement_cb(sample_buffer, current_config.adc.sample_count);
+    }
+    
+    LOG_DBG("Single measurement completed");
+    return;
+    
+error:
+    measurement_state = MEASUREMENT_IDLE;
+    if (service_callbacks.error_cb) {
+        service_callbacks.error_cb(ret, "Single measurement failed");
+    }
+}
+
+static void continuous_measurement_work_handler(struct k_work *work)
+{
+    LOG_DBG("Continuous measurement iteration");
+    
+    if (measurement_state != MEASUREMENT_CONTINUOUS) {
+        LOG_DBG("Continuous measurement stopped");
+        return;
+    }
+    
+    /* Perform the same measurement as single mode */
+    single_measurement_work_handler(&single_measurement_work);
+    
+    /* If still in continuous mode, schedule next measurement */
+    if (measurement_state == MEASUREMENT_CONTINUOUS) {
+        measurement_state = MEASUREMENT_CONTINUOUS; /* Restore state after single measurement */
+        k_work_schedule(&continuous_measurement_work, 
+                       K_MSEC(current_config.repetition_period_ms));
+    }
+}
+
+/*===========================================================================*/
+/*                              COMMAND PROCESSING                          */
+/*===========================================================================*/
+
+static int parse_command_packet(const uint8_t *data, size_t length, 
+                               struct command_packet *cmd)
+{
+    if (!data || length != COMMAND_PACKET_SIZE || !cmd) {
+        return -EINVAL;
+    }
+    
+    cmd->command = data[0];
+    cmd->reserved1 = data[1];
+    cmd->adc_channel_mask = data[2];
+    cmd->reserved3 = data[3];
+    cmd->reserved4 = data[4];
+    cmd->pulse_width = sys_get_le16(&data[5]);
+    cmd->reserved7 = data[7];
+    cmd->sample_count = sys_get_le16(&data[8]);
+    cmd->repetition_freq = sys_get_le16(&data[10]);
+    memcpy(cmd->reserved, &data[12], 4);
+    
+    return 0;
+}
+
+static int validate_measurement_config(const struct measurement_config *config)
+{
+    if (!config) {
+        return -EINVAL;
+    }
+    
+    if (config->adc.channel >= 4) {
+        LOG_ERR("Invalid ADC channel: %d", config->adc.channel);
+        return -EINVAL;
+    }
+    
+    if (config->adc.sample_count == 0 || config->adc.sample_count > MAX_ADC_SAMPLES) {
+        LOG_ERR("Invalid sample count: %d", config->adc.sample_count);
+        return -EINVAL;
+    }
+    
+    if (config->dac.pulse_width_us == 0 || config->dac.pulse_width_us > 10000) {
+        LOG_ERR("Invalid pulse width: %d us", config->dac.pulse_width_us);
+        return -EINVAL;
+    }
+    
+    return 0;
+}
+
+/*===========================================================================*/
+/*                              PUBLIC API FUNCTIONS                        */
+/*===========================================================================*/
+
+int my_lbs_init(struct my_lbs_cb *callbacks)
+{
+    if (callbacks) {
+        service_callbacks = *callbacks;
+    }
+    
+    /* Initialize hardware devices */
+    adc_dev = DEVICE_DT_GET(DT_ALIAS(adc0));
+    if (!device_is_ready(adc_dev)) {
+        LOG_ERR("ADC device not ready");
+        return -ENODEV;
+    }
+    
+    i2c_dev = DEVICE_DT_GET(DT_ALIAS(i2c0));
+    if (!device_is_ready(i2c_dev)) {
+        LOG_ERR("I2C device not ready");
+        return -ENODEV;
+    }
+    
+    /* Configure ADC channels */
+    for (int i = 0; i < 4; i++) {
+        adc_channel_configs[i] = (struct adc_channel_cfg) {
+            .gain = ADC_GAIN_1,
+            .reference = ADC_REF_INTERNAL,
+            .acquisition_time = ADC_ACQ_TIME_DEFAULT,
+            .channel_id = i,
+            .differential = 0
+        };
+        
+        int ret = adc_channel_setup(adc_dev, &adc_channel_configs[i]);
+        if (ret < 0) {
+            LOG_ERR("ADC channel %d setup failed: %d", i, ret);
+            return ret;
+        }
+    }
+    
+    /* Configure ADC sequence */
+    adc_sequence = (struct adc_sequence) {
+        .resolution = ADC_RESOLUTION,
+        .oversampling = 0,
+        .calibrate = false
+    };
+    
+    /* Initialize work items */
+    k_work_init(&single_measurement_work, single_measurement_work_handler);
+    k_work_init_delayable(&continuous_measurement_work, continuous_measurement_work_handler);
+    
+    /* Initialize default command to safe state */
+    memset(default_command, 0, COMMAND_PACKET_SIZE);
+    default_command[0] = CMD_STOP_ALL;
+    
+    LOG_INF("My LBS service initialized successfully");
+    return 0;
+}
+
+int my_lbs_process_command(const uint8_t *data, size_t length)
+{
+    if (!data || length != COMMAND_PACKET_SIZE) {
+        return -EINVAL;
+    }
+    
+    struct command_packet cmd;
+    int ret = parse_command_packet(data, length, &cmd);
+    if (ret < 0) {
+        LOG_ERR("Command parsing failed: %d", ret);
+        return ret;
+    }
+    
+    LOG_DBG("Processing command: 0x%02x", cmd.command);
+    
+    switch (cmd.command) {
+        case CMD_STOP_ALL:
+            ret = my_lbs_stop_measurement();
+            break;
+            
+        case CMD_BATTERY_CHECK: {
+            uint16_t battery_mv;
+            ret = my_lbs_read_battery_voltage(&battery_mv);
+            if (ret == 0) {
+                /* Send battery voltage as notification */
+                my_lbs_send_sensor_notify(battery_mv);
+            }
+            break;
+        }
+        
+        case CMD_START_SINGLE: {
+            struct measurement_config config = {0};
+            
+            /* Parse ADC channel */
+            int channel = my_lbs_parse_adc_channel(cmd.adc_channel_mask);
+            if (channel < 0) {
+                return -EINVAL;
+            }
+            
+            config.adc.channel = channel;
+            config.adc.sample_count = cmd.sample_count ? cmd.sample_count : 100;
+            config.adc.sample_rate = 1000; /* Default 1kHz */
+            
+            config.dac.pulse_width_us = cmd.pulse_width ? cmd.pulse_width : 1000;
+            config.dac.amplitude = 80; /* Default 80% amplitude */
+            
+            ret = my_lbs_start_single_measurement(&config);
+            break;
+        }
+        
+        case CMD_START_CONTINUOUS: {
+            struct measurement_config config = {0};
+            
+            /* Parse ADC channel */
+            int channel = my_lbs_parse_adc_channel(cmd.adc_channel_mask);
+            if (channel < 0) {
+                return -EINVAL;
+            }
+            
+            config.adc.channel = channel;
+            config.adc.sample_count = cmd.sample_count ? cmd.sample_count : 100;
+            config.adc.sample_rate = 1000; /* Default 1kHz */
+            
+            config.dac.pulse_width_us = cmd.pulse_width ? cmd.pulse_width : 1000;
+            config.dac.amplitude = 80; /* Default 80% amplitude */
+            
+            /* Convert frequency to period */
+            uint16_t freq_hz = cmd.repetition_freq ? cmd.repetition_freq : 1;
+            config.repetition_period_ms = 1000 / freq_hz;
+            
+            ret = my_lbs_start_continuous_measurement(&config);
+            break;
+        }
+        
+        case CMD_STOP_MEASUREMENT:
+            ret = my_lbs_stop_measurement();
+            break;
+            
+        case CMD_READ_CONFIG:
+        case CMD_SET_CONFIG:
+            /* TODO: Implement configuration read/write */
+            LOG_INF("Configuration commands not yet implemented");
+            ret = 0;
+            break;
+            
+        default:
+            LOG_WRN("Unknown command: 0x%02x", cmd.command);
+            ret = -ENOTSUP;
+            break;
+    }
+    
+    if (service_callbacks.command_cb) {
+        service_callbacks.command_cb(&cmd);
+    }
+    
+    return ret;
+}
+
+int my_lbs_start_single_measurement(const struct measurement_config *config)
+{
+    if (!config) {
+        return -EINVAL;
+    }
+    
+    if (measurement_state != MEASUREMENT_IDLE) {
+        LOG_WRN("Measurement already in progress");
+        return -EBUSY;
+    }
+    
+    int ret = validate_measurement_config(config);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    current_config = *config;
+    measurement_state = MEASUREMENT_SINGLE;
+    
+    k_work_submit(&single_measurement_work);
+    
+    LOG_INF("Single measurement started on channel %d", config->adc.channel);
+    return 0;
+}
+
+int my_lbs_start_continuous_measurement(const struct measurement_config *config)
+{
+    if (!config) {
+        return -EINVAL;
+    }
+    
+    if (measurement_state != MEASUREMENT_IDLE) {
+        LOG_WRN("Measurement already in progress");
+        return -EBUSY;
+    }
+    
+    int ret = validate_measurement_config(config);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    if (config->repetition_period_ms == 0) {
+        LOG_ERR("Invalid repetition period");
+        return -EINVAL;
+    }
+    
+    current_config = *config;
+    measurement_state = MEASUREMENT_CONTINUOUS;
+    
+    k_work_schedule(&continuous_measurement_work, K_NO_WAIT);
+    
+    LOG_INF("Continuous measurement started on channel %d, period %d ms", 
+            config->adc.channel, config->repetition_period_ms);
+    return 0;
+}
+
+int my_lbs_stop_measurement(void)
+{
+    if (measurement_state == MEASUREMENT_IDLE) {
+        return -EALREADY;
+    }
+    
+    measurement_state = MEASUREMENT_IDLE;
+    
+    /* Cancel any pending work */
+    k_work_cancel(&single_measurement_work);
+    k_work_cancel_delayable(&continuous_measurement_work);
+    
+    /* Turn off DAC */
+    dac_write_value(0);
+    
+    LOG_INF("Measurement stopped");
+    return 0;
+}
+
+int my_lbs_read_battery_voltage(uint16_t *voltage_mv)
+{
+    if (!voltage_mv) {
+        return -EINVAL;
+    }
+    
+    uint16_t adc_value;
+    int ret = adc_read_channel(BATTERY_VOLTAGE_CHANNEL, &adc_value);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    /* Convert ADC value to millivolts */
+    *voltage_mv = (adc_value * ADC_REFERENCE_MV) / ((1 << ADC_RESOLUTION) - 1);
+    
+    LOG_DBG("Battery voltage: %d mV (ADC: %d)", *voltage_mv, adc_value);
+    return 0;
+}
+
+enum measurement_state my_lbs_get_measurement_state(void)
+{
+    return measurement_state;
+}
+
+int my_lbs_parse_adc_channel(uint8_t channel_mask)
+{
+    switch (channel_mask) {
+        case ADC_CHANNEL_0:
+            return 0;
+        case ADC_CHANNEL_1:
+            return 1;
+        case ADC_CHANNEL_2:
+            return 2;
+        case ADC_CHANNEL_3:
+            return 3;
+        default:
+            LOG_ERR("Invalid or multiple ADC channels selected: 0x%02x", channel_mask);
+            return -EINVAL;
+    }
+}
+
+int my_lbs_send_adc_data_notify(const uint16_t *data, size_t length)
+{
+    if (!data || length == 0) {
+        return -EINVAL;
+    }
+    
+    /* Find the DATA characteristic attribute */
+    const struct bt_gatt_attr *attr = bt_gatt_find_by_uuid(my_lbs_svc.attrs,
+                                                          my_lbs_svc.attr_count,
+                                                          BT_UUID_PBM_DATA);
+    if (!attr) {
+        LOG_ERR("DATA characteristic not found");
+        return -ENOENT;
+    }
+    
+    /* Convert data to bytes for transmission */
+    size_t data_size = length * sizeof(uint16_t);
+    
+    int ret = bt_gatt_notify(NULL, attr, data, data_size);
+    if (ret < 0) {
+        LOG_ERR("Data notification failed: %d", ret);
+        return ret;
+    }
+    
+    LOG_DBG("Sent %d ADC samples via notification", length);
+    return 0;
+}
+
+int my_lbs_send_button_state_indicate(bool button_state)
+{
+    /* Implementation depends on your specific button characteristic */
+    LOG_DBG("Button state indication: %s", button_state ? "pressed" : "released");
+    
+    if (service_callbacks.button_cb) {
+        return service_callbacks.button_cb() ? 0 : -EIO;
+    }
+    
+    return 0;
+}
+
+int my_lbs_send_button_state_notify(bool button_state)
+{
+    /* Implementation depends on your specific button characteristic */
+    LOG_DBG("Button state notification: %s", button_state ? "pressed" : "released");
+    
+    if (service_callbacks.button_cb) {
+        return service_callbacks.button_cb() ? 0 : -EIO;
+    }
+    
+    return 0;
+}
+
+int my_lbs_send_sensor_notify(uint32_t sensor_value)
+{
+    /* Find the MESSAGE characteristic for sensor notifications */
+    const struct bt_gatt_attr *attr = bt_gatt_find_by_uuid(my_lbs_svc.attrs,
+                                                          my_lbs_svc.attr_count,
+                                                          BT_UUID_PBM_MESSAGE);
+    if (!attr) {
+        LOG_ERR("MESSAGE characteristic not found");
+        return -ENOENT;
+    }
+    
+    int ret = bt_gatt_notify(NULL, attr, &sensor_value, sizeof(sensor_value));
+    if (ret < 0) {
+        LOG_ERR("Sensor notification failed: %d", ret);
+        return ret;
+    }
+    
+    LOG_DBG("Sent sensor value: %d", sensor_value);
+    return 0;
+}
