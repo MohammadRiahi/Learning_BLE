@@ -260,7 +260,10 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 			LOG_INF("Command: STOP_MEASUREMENT");
 			// Handle stop measurement command
 			break;
-			
+		case CMD_START_SINGLE:
+			LOG_INF("Command: START_SINGLE");
+			// Handle start single command
+			break;
 		case CMD_START_CONTINUOUS:
 			LOG_INF("Command: START_CONTINUOUS");
 			// Handle start continuous command
