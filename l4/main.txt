@@ -1,0 +1,692 @@
+/*
+ * Copyright (c) 2025 Your Organization
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/led.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/services/bas.h>
+
+#include <zephyr/settings/settings.h>
+
+#include "my_lbs.h"
+
+LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
+
+/*===========================================================================*/
+/*                              CONFIGURATION                               */
+/*===========================================================================*/
+
+/* LED and Button GPIO configuration */
+#define LED0_NODE    DT_ALIAS(led0)
+#define LED1_NODE    DT_ALIAS(led1)
+#define LED2_NODE    DT_ALIAS(led2)
+#define LED3_NODE    DT_ALIAS(led3)
+#define BUTTON0_NODE DT_ALIAS(sw0)
+#define BUTTON1_NODE DT_ALIAS(sw1)
+
+/* Check if devices are available */
+#if !DT_NODE_EXISTS(LED0_NODE)
+#error "Unsupported board: led0 devicetree alias is not defined"
+#endif
+
+#if !DT_NODE_EXISTS(BUTTON0_NODE)
+#error "Unsupported board: sw0 devicetree alias is not defined"
+#endif
+
+/* GPIO specifications */
+static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET_OR(LED1_NODE, gpios, {0});
+static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET_OR(LED2_NODE, gpios, {0});
+static const struct gpio_dt_spec led3 = GPIO_DT_SPEC_GET_OR(LED3_NODE, gpios, {0});
+static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(BUTTON0_NODE, gpios);
+static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET_OR(BUTTON1_NODE, gpios, {0});
+
+/* Button callback data */
+static struct gpio_callback button0_cb_data;
+static struct gpio_callback button1_cb_data;
+
+/* Application state */
+static struct {
+    bool led_state[4];
+    bool button_state[2];
+    bool connected;
+    uint32_t connection_count;
+    uint32_t measurement_count;
+} app_state = {0};
+
+/* Timing and work queues */
+#define STATUS_LED_BLINK_INTERVAL_MS  1000
+#define HEARTBEAT_INTERVAL_MS         5000
+#define BUTTON_DEBOUNCE_MS           50
+
+static struct k_work_delayable status_led_work;
+static struct k_work_delayable heartbeat_work;
+static struct k_work button_work;
+
+/*===========================================================================*/
+/*                              BLE CONFIGURATION                           */
+/*===========================================================================*/
+
+/* Advertising data */
+static const struct bt_data ad[] = {
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_PBM_ADVERTISING_VAL),
+    BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+};
+
+/* Scan response data */
+static const struct bt_data sd[] = {
+    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_PBM_VAL),
+};
+
+/* Connection parameters */
+#define MIN_CONN_INTERVAL    6   /* 7.5 ms (6 * 1.25 ms) */
+#define MAX_CONN_INTERVAL    80  /* 100 ms (80 * 1.25 ms) */
+#define SLAVE_LATENCY        0   /* No slave latency */
+#define CONN_SUP_TIMEOUT     400 /* 4 seconds (400 * 10 ms) */
+
+static struct bt_le_conn_param conn_param = {
+    .interval_min = MIN_CONN_INTERVAL,
+    .interval_max = MAX_CONN_INTERVAL,
+    .latency = SLAVE_LATENCY,
+    .timeout = CONN_SUP_TIMEOUT,
+};
+
+/*===========================================================================*/
+/*                              FORWARD DECLARATIONS                        */
+/*===========================================================================*/
+
+static void button0_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins);
+static void button1_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins);
+static void button_work_handler(struct k_work *work);
+
+static void status_led_work_handler(struct k_work *work);
+static void heartbeat_work_handler(struct k_work *work);
+
+static void led_cb_handler(const bool led_state);
+static bool button_cb_handler(void);
+static int command_cb_handler(const struct command_packet *cmd);
+static void measurement_complete_cb_handler(const uint16_t *data, size_t length);
+static void error_cb_handler(int error_code, const char *error_msg);
+
+static void connected(struct bt_conn *conn, uint8_t err);
+static void disconnected(struct bt_conn *conn, uint8_t reason);
+static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param);
+static void le_param_updated(struct bt_conn *conn, uint16_t interval,
+                            uint16_t latency, uint16_t timeout);
+
+static int init_hardware(void);
+static int init_bluetooth(void);
+static void start_advertising(void);
+
+/*===========================================================================*/
+/*                              CALLBACK IMPLEMENTATIONS                    */
+/*===========================================================================*/
+
+static void led_cb_handler(const bool led_state)
+{
+    LOG_DBG("LED callback: %s", led_state ? "ON" : "OFF");
+    
+    app_state.led_state[0] = led_state;
+    
+    if (gpio_is_ready_dt(&led0)) {
+        gpio_pin_set_dt(&led0, led_state ? 1 : 0);
+    }
+}
+
+static bool button_cb_handler(void)
+{
+    bool state = app_state.button_state[0];
+    LOG_DBG("Button callback: %s", state ? "PRESSED" : "RELEASED");
+    return state;
+}
+
+static int command_cb_handler(const struct command_packet *cmd)
+{
+    if (!cmd) {
+        return -EINVAL;
+    }
+    
+    LOG_INF("Command received: 0x%02x", cmd->command);
+    
+    /* Update measurement count for statistics */
+    if (cmd->command == CMD_START_SINGLE || cmd->command == CMD_START_CONTINUOUS) {
+        app_state.measurement_count++;
+    }
+    
+    /* Visual feedback for different commands */
+    switch (cmd->command) {
+        case CMD_BATTERY_CHECK:
+            /* Blink LED1 twice for battery check */
+            if (gpio_is_ready_dt(&led1)) {
+                gpio_pin_set_dt(&led1, 1);
+                k_msleep(100);
+                gpio_pin_set_dt(&led1, 0);
+                k_msleep(100);
+                gpio_pin_set_dt(&led1, 1);
+                k_msleep(100);
+                gpio_pin_set_dt(&led1, 0);
+            }
+            break;
+            
+        case CMD_START_SINGLE:
+        case CMD_START_CONTINUOUS:
+            /* Turn on LED2 during measurements */
+            if (gpio_is_ready_dt(&led2)) {
+                gpio_pin_set_dt(&led2, 1);
+            }
+            break;
+            
+        case CMD_STOP_MEASUREMENT:
+        case CMD_STOP_ALL:
+            /* Turn off LED2 when stopping */
+            if (gpio_is_ready_dt(&led2)) {
+                gpio_pin_set_dt(&led2, 0);
+            }
+            break;
+    }
+    
+    return 0;
+}
+
+static void measurement_complete_cb_handler(const uint16_t *data, size_t length)
+{
+    if (!data || length == 0) {
+        return;
+    }
+    
+    LOG_INF("Measurement completed: %d samples", length);
+    
+    /* Calculate basic statistics for logging */
+    uint32_t sum = 0;
+    uint16_t min_val = data[0];
+    uint16_t max_val = data[0];
+    
+    for (size_t i = 0; i < length; i++) {
+        sum += data[i];
+        if (data[i] < min_val) min_val = data[i];
+        if (data[i] > max_val) max_val = data[i];
+    }
+    
+    uint16_t avg_val = sum / length;
+    
+    LOG_INF("Sample stats - Min: %d, Max: %d, Avg: %d", min_val, max_val, avg_val);
+    
+    /* Brief LED3 flash to indicate completion */
+    if (gpio_is_ready_dt(&led3)) {
+        gpio_pin_set_dt(&led3, 1);
+        k_msleep(200);
+        gpio_pin_set_dt(&led3, 0);
+    }
+}
+
+static void error_cb_handler(int error_code, const char *error_msg)
+{
+    LOG_ERR("Service error %d: %s", error_code, error_msg ? error_msg : "Unknown error");
+    
+    /* Flash all LEDs rapidly to indicate error */
+    for (int i = 0; i < 5; i++) {
+        if (gpio_is_ready_dt(&led0)) gpio_pin_set_dt(&led0, 1);
+        if (gpio_is_ready_dt(&led1)) gpio_pin_set_dt(&led1, 1);
+        if (gpio_is_ready_dt(&led2)) gpio_pin_set_dt(&led2, 1);
+        if (gpio_is_ready_dt(&led3)) gpio_pin_set_dt(&led3, 1);
+        
+        k_msleep(100);
+        
+        if (gpio_is_ready_dt(&led0)) gpio_pin_set_dt(&led0, 0);
+        if (gpio_is_ready_dt(&led1)) gpio_pin_set_dt(&led1, 0);
+        if (gpio_is_ready_dt(&led2)) gpio_pin_set_dt(&led2, 0);
+        if (gpio_is_ready_dt(&led3)) gpio_pin_set_dt(&led3, 0);
+        
+        k_msleep(100);
+    }
+}
+
+/*===========================================================================*/
+/*                              GPIO HANDLERS                               */
+/*===========================================================================*/
+
+static void button0_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(cb);
+    ARG_UNUSED(pins);
+    
+    k_work_submit(&button_work);
+}
+
+static void button1_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(cb);
+    ARG_UNUSED(pins);
+    
+    /* Button1 can be used for additional functionality */
+    LOG_INF("Button 1 pressed - triggering battery check");
+    
+    /* Send battery check command */
+    uint8_t battery_cmd[16] = {CMD_BATTERY_CHECK, 0};
+    my_lbs_process_command(battery_cmd, sizeof(battery_cmd));
+}
+
+static void button_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    
+    /* Read current button state with debouncing */
+    int button_val = gpio_pin_get_dt(&button0);
+    if (button_val < 0) {
+        LOG_ERR("Failed to read button state");
+        return;
+    }
+    
+    bool new_state = (button_val == 1);
+    
+    if (new_state != app_state.button_state[0]) {
+        app_state.button_state[0] = new_state;
+        
+        LOG_INF("Button 0 %s", new_state ? "pressed" : "released");
+        
+        /* Send button state notification */
+        if (app_state.connected) {
+            my_lbs_send_button_state_notify(new_state);
+        }
+        
+        /* If button pressed, demonstrate single measurement */
+        if (new_state) {
+            LOG_INF("Button pressed - starting single measurement demo");
+            uint8_t single_cmd[16] = {
+                CMD_START_SINGLE,    /* Command */
+                0,                   /* Reserved */
+                ADC_CHANNEL_0,       /* Channel 0 */
+                0, 0,               /* Reserved */
+                0x64, 0x00,         /* Pulse width: 100us (little endian) */
+                0,                  /* Reserved */
+                0x64, 0x00,         /* Sample count: 100 (little endian) */
+                0x01, 0x00,         /* Frequency: 1Hz (little endian) */
+                0, 0, 0, 0          /* Reserved */
+            };
+            my_lbs_process_command(single_cmd, sizeof(single_cmd));
+        }
+    }
+}
+
+/*===========================================================================*/
+/*                              WORK HANDLERS                               */
+/*===========================================================================*/
+
+static void status_led_work_handler(struct k_work *work)
+{
+    static bool led_on = false;
+    
+    ARG_UNUSED(work);
+    
+    /* Status LED indicates connection state */
+    if (app_state.connected) {
+        /* Solid on when connected */
+        if (gpio_is_ready_dt(&led0)) {
+            gpio_pin_set_dt(&led0, 1);
+        }
+    } else {
+        /* Blink when advertising/disconnected */
+        led_on = !led_on;
+        if (gpio_is_ready_dt(&led0)) {
+            gpio_pin_set_dt(&led0, led_on ? 1 : 0);
+        }
+    }
+    
+    /* Schedule next blink */
+    k_work_reschedule(&status_led_work, K_MSEC(STATUS_LED_BLINK_INTERVAL_MS));
+}
+
+static void heartbeat_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    
+    static uint32_t heartbeat_counter = 0;
+    heartbeat_counter++;
+    
+    LOG_INF("Heartbeat #%d - Connected: %s, Measurements: %d", 
+            heartbeat_counter,
+            app_state.connected ? "Yes" : "No",
+            app_state.measurement_count);
+    
+    /* Send heartbeat if connected */
+    if (app_state.connected) {
+        /* Use MESSAGE characteristic for heartbeat */
+        my_lbs_send_sensor_notify(heartbeat_counter);
+    }
+    
+    /* Schedule next heartbeat */
+    k_work_reschedule(&heartbeat_work, K_MSEC(HEARTBEAT_INTERVAL_MS));
+}
+
+/*===========================================================================*/
+/*                              BLE CALLBACKS                               */
+/*===========================================================================*/
+
+static void connected(struct bt_conn *conn, uint8_t err)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+    
+    if (err) {
+        LOG_ERR("Connection failed (err 0x%02x)", err);
+        start_advertising();
+        return;
+    }
+    
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    LOG_INF("Connected to %s", addr);
+    
+    app_state.connected = true;
+    app_state.connection_count++;
+    
+    /* Update connection parameters */
+    int ret = bt_conn_le_param_update(conn, &conn_param);
+    if (ret) {
+        LOG_WRN("Failed to update connection parameters (err %d)", ret);
+    }
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
+    
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+    LOG_INF("Disconnected from %s (reason 0x%02x)", addr, reason);
+    
+    app_state.connected = false;
+    
+    /* Stop any ongoing measurements */
+    my_lbs_stop_measurement();
+    
+    /* Turn off measurement indicator LED */
+    if (gpio_is_ready_dt(&led2)) {
+        gpio_pin_set_dt(&led2, 0);
+    }
+    
+    /* Restart advertising */
+    start_advertising();
+}
+
+static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
+{
+    ARG_UNUSED(conn);
+    
+    LOG_DBG("Connection parameter request - interval: %d-%d, latency: %d, timeout: %d",
+            param->interval_min, param->interval_max, param->latency, param->timeout);
+    
+    /* Accept reasonable parameters for low latency */
+    if (param->interval_min >= 6 && param->interval_max <= 200 &&
+        param->latency <= 30 && param->timeout >= 10 && param->timeout <= 3200) {
+        return true;
+    }
+    
+    return false;
+}
+
+static void le_param_updated(struct bt_conn *conn, uint16_t interval,
+                            uint16_t latency, uint16_t timeout)
+{
+    ARG_UNUSED(conn);
+    
+    LOG_INF("Connection parameters updated - interval: %d (%.2f ms), latency: %d, timeout: %d",
+            interval, interval * 1.25, latency, timeout);
+}
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+    .connected = connected,
+    .disconnected = disconnected,
+    .le_param_req = le_param_req,
+    .le_param_updated = le_param_updated,
+};
+
+/*===========================================================================*/
+/*                              INITIALIZATION                              */
+/*===========================================================================*/
+
+static int init_hardware(void)
+{
+    int ret;
+    
+    LOG_INF("Initializing hardware...");
+    
+    /* Configure LEDs */
+    if (gpio_is_ready_dt(&led0)) {
+        ret = gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure LED0 (err %d)", ret);
+            return ret;
+        }
+        LOG_DBG("LED0 configured");
+    }
+    
+    if (gpio_is_ready_dt(&led1)) {
+        ret = gpio_pin_configure_dt(&led1, GPIO_OUTPUT_INACTIVE);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure LED1 (err %d)", ret);
+            return ret;
+        }
+        LOG_DBG("LED1 configured");
+    }
+    
+    if (gpio_is_ready_dt(&led2)) {
+        ret = gpio_pin_configure_dt(&led2, GPIO_OUTPUT_INACTIVE);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure LED2 (err %d)", ret);
+            return ret;
+        }
+        LOG_DBG("LED2 configured");
+    }
+    
+    if (gpio_is_ready_dt(&led3)) {
+        ret = gpio_pin_configure_dt(&led3, GPIO_OUTPUT_INACTIVE);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure LED3 (err %d)", ret);
+            return ret;
+        }
+        LOG_DBG("LED3 configured");
+    }
+    
+    /* Configure buttons */
+    if (!gpio_is_ready_dt(&button0)) {
+        LOG_ERR("Button0 device not ready");
+        return -ENODEV;
+    }
+    
+    ret = gpio_pin_configure_dt(&button0, GPIO_INPUT);
+    if (ret < 0) {
+        LOG_ERR("Failed to configure button0 (err %d)", ret);
+        return ret;
+    }
+    
+    ret = gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_BOTH);
+    if (ret < 0) {
+        LOG_ERR("Failed to configure button0 interrupt (err %d)", ret);
+        return ret;
+    }
+    
+    gpio_init_callback(&button0_cb_data, button0_pressed, BIT(button0.pin));
+    gpio_add_callback(button0.port, &button0_cb_data);
+    LOG_DBG("Button0 configured");
+    
+    if (gpio_is_ready_dt(&button1)) {
+        ret = gpio_pin_configure_dt(&button1, GPIO_INPUT);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure button1 (err %d)", ret);
+            return ret;
+        }
+        
+        ret = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_BOTH);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure button1 interrupt (err %d)", ret);
+            return ret;
+        }
+        
+        gpio_init_callback(&button1_cb_data, button1_pressed, BIT(button1.pin));
+        gpio_add_callback(button1.port, &button1_cb_data);
+        LOG_DBG("Button1 configured");
+    }
+    
+    /* Initialize work items */
+    k_work_init(&button_work, button_work_handler);
+    k_work_init_delayable(&status_led_work, status_led_work_handler);
+    k_work_init_delayable(&heartbeat_work, heartbeat_work_handler);
+    
+    LOG_INF("Hardware initialization completed");
+    return 0;
+}
+
+static int init_bluetooth(void)
+{
+    int ret;
+    
+    LOG_INF("Initializing Bluetooth...");
+    
+    ret = bt_enable(NULL);
+    if (ret) {
+        LOG_ERR("Bluetooth init failed (err %d)", ret);
+        return ret;
+    }
+    
+    LOG_INF("Bluetooth initialized");
+    
+    /* Load settings */
+    if (IS_ENABLED(CONFIG_SETTINGS)) {
+        settings_load();
+        LOG_DBG("Settings loaded");
+    }
+    
+    /* Initialize custom service */
+    struct my_lbs_cb service_cb = {
+        .led_cb = led_cb_handler,
+        .button_cb = button_cb_handler,
+        .command_cb = command_cb_handler,
+        .measurement_cb = measurement_complete_cb_handler,
+        .error_cb = error_cb_handler,
+    };
+    
+    ret = my_lbs_init(&service_cb);
+    if (ret) {
+        LOG_ERR("Failed to initialize LBS service (err %d)", ret);
+        return ret;
+    }
+    
+    LOG_INF("Custom BLE service initialized");
+    return 0;
+}
+
+static void start_advertising(void)
+{
+    int ret;
+    
+    struct bt_le_adv_param adv_param = {
+        .id = BT_ID_DEFAULT,
+        .sid = 0,
+        .secondary_max_skip = 0,
+        .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
+        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
+        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
+        .peer = NULL,
+    };
+    
+    ret = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (ret) {
+        LOG_ERR("Advertising failed to start (err %d)", ret);
+        return;
+    }
+    
+    LOG_INF("Advertising started");
+    
+    /* Print device address for debugging */
+    bt_addr_le_t addr;
+    size_t count = 1;
+    bt_id_get(&addr, &count);
+    
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(&addr, addr_str, sizeof(addr_str));
+    LOG_INF("Device address: %s", addr_str);
+}
+
+/*===========================================================================*/
+/*                              MAIN FUNCTION                               */
+/*===========================================================================*/
+
+int main(void)
+{
+    int ret;
+    
+    LOG_INF("=== PBM BLE Service Application Starting ===");
+    LOG_INF("Build: %s %s", __DATE__, __TIME__);
+    
+    /* Initialize hardware */
+    ret = init_hardware();
+    if (ret) {
+        LOG_ERR("Hardware initialization failed (err %d)", ret);
+        return ret;
+    }
+    
+    /* Initialize Bluetooth */
+    ret = init_bluetooth();
+    if (ret) {
+        LOG_ERR("Bluetooth initialization failed (err %d)", ret);
+        return ret;
+    }
+    
+    /* Start advertising */
+    start_advertising();
+    
+    /* Start work items */
+    k_work_schedule(&status_led_work, K_MSEC(STATUS_LED_BLINK_INTERVAL_MS));
+    k_work_schedule(&heartbeat_work, K_MSEC(HEARTBEAT_INTERVAL_MS));
+    
+    /* Startup sequence - flash all LEDs */
+    LOG_INF("Startup complete - ready for connections");
+    for (int i = 0; i < 3; i++) {
+        if (gpio_is_ready_dt(&led0)) gpio_pin_set_dt(&led0, 1);
+        if (gpio_is_ready_dt(&led1)) gpio_pin_set_dt(&led1, 1);
+        if (gpio_is_ready_dt(&led2)) gpio_pin_set_dt(&led2, 1);
+        if (gpio_is_ready_dt(&led3)) gpio_pin_set_dt(&led3, 1);
+        
+        k_msleep(200);
+        
+        if (gpio_is_ready_dt(&led0)) gpio_pin_set_dt(&led0, 0);
+        if (gpio_is_ready_dt(&led1)) gpio_pin_set_dt(&led1, 0);
+        if (gpio_is_ready_dt(&led2)) gpio_pin_set_dt(&led2, 0);
+        if (gpio_is_ready_dt(&led3)) gpio_pin_set_dt(&led3, 0);
+        
+        k_msleep(200);
+    }
+    
+    /* Main application loop */
+    while (1) {
+        /* Print periodic status */
+        k_sleep(K_SECONDS(30));
+        
+        LOG_INF("Status: Connected=%s, Connections=%d, Measurements=%d, State=%d",
+                app_state.connected ? "Yes" : "No",
+                app_state.connection_count,
+                app_state.measurement_count,
+                my_lbs_get_measurement_state());
+        
+        /* Optional: Print memory usage */
+        if (IS_ENABLED(CONFIG_THREAD_MONITOR)) {
+            size_t unused;
+            k_thread_stack_space_get(k_current_get(), &unused);
+            LOG_DBG("Stack usage: %d bytes unused", unused);
+        }
+    }
+    
+    return 0;
+}
