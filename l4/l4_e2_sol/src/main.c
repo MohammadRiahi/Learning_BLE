@@ -108,9 +108,9 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
 {
 	if (has_changed & USER_BUTTON) {
 		uint32_t user_button_state = button_state & USER_BUTTON;
-		/* STEP 6 - Send indication on a button press */
-		//my_lbs_send_button_state_indicate(user_button_state);
 		app_button_state = user_button_state ? true : false;
+		// Button just updates the button state for the button characteristic
+		// No streaming control here - that's done via BLE commands
 	}
 }
 static void on_connected(struct bt_conn *conn, uint8_t err)
@@ -121,6 +121,21 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 	}
 
 	printk("Connected\n");
+	
+	// Log connection parameters
+	struct bt_conn_info info;
+	int ret = bt_conn_get_info(conn, &info);
+	if (ret == 0) {
+		double connection_interval = info.le.interval * 1.25; // Convert to ms
+		uint16_t supervision_timeout = info.le.timeout * 10;   // Convert to ms
+		printk("Connection parameters: interval %.2f ms, latency %d intervals, timeout %d ms\n", 
+			connection_interval, info.le.latency, supervision_timeout);
+	}
+	
+	printk("Use your BLE app to:\n");
+	printk("1. Enable DATA characteristic notifications\n");
+	printk("2. Write [0x00, 0x11, 0x00...] to COMMAND characteristic to START streaming\n");
+	printk("3. Write [0x00, 0x12, 0x00...] to COMMAND characteristic to STOP streaming\n");
 
 	dk_set_led_on(CON_STATUS_LED);
 }

@@ -54,8 +54,68 @@ static struct my_lbs_cb lbs_cb;
 static uint8_t command_buffer[16]; // Buffer to store 16-byte commands
 static uint8_t heartbeat_buffer[8]; // Buffer for heartbeat value
 static char message_buffer[120]; // Static buffer for JSON messages
+static char data_buffer[244]; // Buffer for DATA characteristic
 // Define the default command array
 uint8_t default_command[16] = {0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+// Simple continuous measurement variables
+static bool is_measuring = false;
+static struct k_work_delayable continuous_work;
+
+// ADC and data packet configuration
+#define DATAPACKET_SIZE 244
+#define SENSOR_PIN 0  // ADC channel to use
+
+// Simple ADC read function (placeholder until ADC is properly configured)
+static uint16_t read_adc_averaged(uint8_t pin, uint8_t n)
+{
+    // TODO: Replace with actual ADC reading when CONFIG_ADC is enabled
+    // For now, return simulated data
+    static uint16_t adc_value = 1000;
+    adc_value += (k_uptime_get_32() % 40) - 20; // Add variation
+    if (adc_value > 4095) adc_value = 4095;
+    if (adc_value < 0) adc_value = 0;
+    return adc_value;
+}
+
+// Get timestamp function
+static uint64_t get_timestamp(void)
+{
+    return k_uptime_get(); // System uptime in milliseconds
+}
+
+// Prepare data packet in the specified format
+static void prepare_data_packet(uint8_t* data_packet)
+{
+    // Include timestamp in the packet (6 bytes)
+    uint64_t unix_time = get_timestamp();
+    for (int i = 0; i < 6; i++) {
+        data_packet[i] = (unix_time >> (i * 8)) & 0xFF;
+    }
+
+    // Data format configuration
+    const uint8_t num_channels = 1;    // 1 channel
+    const uint8_t precision = 1;       // 1 => 16-bit
+    const uint8_t channel_index = (1 << 0) << 4;  // channel 0 => bit4
+    uint8_t bytes_per_sample = precision + 1;     // 2 bytes
+    uint8_t encoded_num_channels = num_channels - 1;  // 1 channel -> 0
+
+    uint8_t data_format = (encoded_num_channels & 0x03)
+        | ((precision & 0x03) << 2)
+        | (channel_index & 0xF0);
+
+    data_packet[6] = data_format;
+    data_packet[7] = (DATAPACKET_SIZE - 8) / (num_channels * bytes_per_sample);
+    
+    int num_samples = data_packet[7]; // Number of samples
+
+    // Fill ADC values
+    for (int i = 0; i < num_samples; i++) {
+        uint16_t adc_buffer = read_adc_averaged(SENSOR_PIN, averaging);
+        data_packet[8 + (i * 2)] = (adc_buffer >> 8) & 0xFF;
+        data_packet[9 + (i * 2)] = adc_buffer & 0xFF;
+    }
+}
 
 /* STEP 4 - Define an indication parameter */
 //static struct bt_gatt_indicate_params ind_params;
@@ -76,6 +136,54 @@ static void mylbsbc_ccc_DATA_cfg_changed(const struct bt_gatt_attr *attr, uint16
 	notify_DATA_enabled = (value == BT_GATT_CCC_NOTIFY);
 	LOG_INF("DATA CCCD changed: %u, notifications %s", value, 
 		notify_DATA_enabled ? "enabled" : "disabled");
+}
+
+// Simple continuous measurement functions
+static void continuous_work_handler(struct k_work *work)
+{
+	if (!is_measuring || !notify_DATA_enabled) {
+		return;
+	}
+	
+	// Clear the data buffer and prepare data packet
+	memset(data_buffer, 0, sizeof(data_buffer));
+	prepare_data_packet((uint8_t*)data_buffer);
+	
+	// Send data via DATA characteristic with error handling
+	int result = bt_gatt_notify(NULL, &my_pbm_svc.attrs[5], data_buffer, DATAPACKET_SIZE);
+	if (result == 0) {
+		LOG_DBG("Sent data packet (%d bytes)", DATAPACKET_SIZE);
+	} else if (result == -ENOMEM) {
+		LOG_WRN("BLE buffers full, skipping packet");
+		// Don't stop measurement, just skip this packet
+	} else {
+		LOG_ERR("Failed to send data packet: %d", result);
+	}
+	
+	// Schedule next measurement - realistic BLE timing
+	// For 244-byte packets, minimum practical interval is ~50ms
+	uint32_t interval_ms = 1000 / samplingRate;
+	if (interval_ms < 50) interval_ms = 50; // Minimum 50ms for large packets
+	k_work_reschedule(&continuous_work, K_MSEC(interval_ms));
+}
+
+static void start_continuous_measurement(void)
+{
+	if (is_measuring) {
+		LOG_WRN("Already measuring");
+		return;
+	}
+	
+	is_measuring = true;
+	LOG_INF("Starting continuous measurement at %d Hz", samplingRate);
+	k_work_schedule(&continuous_work, K_NO_WAIT);
+}
+
+static void stop_continuous_measurement(void)
+{
+	is_measuring = false;
+	k_work_cancel_delayable(&continuous_work);
+	LOG_INF("Stopped continuous measurement");
 }
 
 static ssize_t write_heartbeat(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
@@ -258,15 +366,27 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 			
 		case CMD_STOP_MEASUREMENT:
 			LOG_INF("Command: STOP_MEASUREMENT");
-			// Handle stop measurement command
+			stop_continuous_measurement();
 			break;
 		case CMD_START_SINGLE:
 			LOG_INF("Command: START_SINGLE");
-			// Handle start single command
+			// Send a single data packet
+			if (notify_DATA_enabled) {
+				memset(data_buffer, 0, sizeof(data_buffer));
+				prepare_data_packet((uint8_t*)data_buffer);
+				int result = bt_gatt_notify(NULL, &my_pbm_svc.attrs[5], data_buffer, DATAPACKET_SIZE);
+				if (result == 0) {
+					LOG_INF("Single data packet sent (%d bytes)", DATAPACKET_SIZE);
+				} else {
+					LOG_ERR("Failed to send single data packet: %d", result);
+				}
+			} else {
+				LOG_WRN("DATA notifications not enabled");
+			}
 			break;
 		case CMD_START_CONTINUOUS:
 			LOG_INF("Command: START_CONTINUOUS");
-			// Handle start continuous command
+			start_continuous_measurement();
 			break;
 			
 		default:
@@ -346,6 +466,10 @@ int my_lbs_init(struct my_lbs_cb *callbacks)
 		lbs_cb.led_cb = callbacks->led_cb;
 		lbs_cb.button_cb = callbacks->button_cb;
 	}
+	
+	// Initialize continuous measurement work
+	k_work_init_delayable(&continuous_work, continuous_work_handler);
+	
 	LOG_INF("LBS service initialization completed");
 	return 0;
 }
