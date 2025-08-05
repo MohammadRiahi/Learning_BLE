@@ -31,7 +31,7 @@ LOG_MODULE_DECLARE(Lesson4_Exercise2);
 extern const struct bt_gatt_service_static my_pbm_svc;
 // Sampling parameters 
 volatile uint8_t averaging  = 1;
-volatile uint32_t samplingRate = 1000;
+volatile uint32_t samplingRate = 2; // Hz
 
 /* Helper function to decode sample rate from code */
 static uint32_t decodeSampleRate(uint8_t code) {
@@ -251,6 +251,8 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 		case CMD_STOP_ALL:
 			LOG_INF("Command: STOP_ALL");
 			// Handle stop all command
+			LOG_INF("Command: STOP_MEASUREMENT");
+			stop_continuous_measurement();
 			break;
 			
 		case CMD_BATTERY_CHECK:
@@ -365,14 +367,15 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 			break;
 			
 		case CMD_STOP_MEASUREMENT:
-			LOG_INF("Command: STOP_MEASUREMENT");
-			stop_continuous_measurement();
+			//LOG_INF("Command: STOP_MEASUREMENT");
+			//stop_continuous_measurement();
 			break;
 		case CMD_START_SINGLE:
 			LOG_INF("Command: START_SINGLE");
 			// Send a single data packet
 			if (notify_DATA_enabled) {
-				memset(data_buffer, 0, sizeof(data_buffer));
+				memset(data_buffer, 0, sizeof(data_buffer)); // filling the buffer with zeros
+				// Prepare the data packet with the current timestamp and ADC values
 				prepare_data_packet((uint8_t*)data_buffer);
 				int result = bt_gatt_notify(NULL, &my_pbm_svc.attrs[5], data_buffer, DATAPACKET_SIZE);
 				if (result == 0) {

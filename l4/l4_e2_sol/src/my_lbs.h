@@ -61,9 +61,9 @@ enum CommandType {
     CMD_BATTERY_CHECK = 0x01,
     CMD_READ_CONFIG = 0x04,
     CMD_SET_CONFIG = 0x05,
-	CMD_START_SINGLE = 0x10,
-    CMD_START_CONTINUOUS = 0x11,
-	CMD_STOP_MEASUREMENT = 0x12
+	CMD_START_SINGLE = 0x11,
+    CMD_START_CONTINUOUS = 0x12,
+	CMD_STOP_MEASUREMENT = 0x13,
 };
 // Remove the global array definition from header file
 // This should be defined in a .c file, not here
