@@ -23,15 +23,15 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/device.h>
-#include <C:\ncs\v2.6.1\modules\hal\nordic\nrfx\hal\nrf_saadc.h>
+//#include <C:\ncs\v2.6.1\modules\hal\nordic\nrfx\hal\nrf_saadc.h>
+#include <C:\ncs\v3.0.2\zephyr\include\zephyr\dt-bindings\adc\nrf-saadc-v3.h>
 
 #include "my_lbs.h"
 
 
 #define ADC_RESOLUTION 12
-#define ADC_GAIN ADC_GAIN_1
-#define ADC_REFERENCE ADC_REF_INTERNAL
 #define ADC_ACQUISITION_TIME ADC_ACQ_TIME_DEFAULT // you can change the acquisition time for higher accuracy
+// Note: gain and reference are now configured in app.overlay device tree
 
 LOG_MODULE_DECLARE(Lesson4_Exercise2);
 /* LOG_DBG("Bluetooth initialized\n"); */
@@ -85,26 +85,37 @@ static struct adc_sequence sequence;
 
 static void adc_setup(uint8_t channel)
 {
-	
-    channel_cfg.gain = ADC_GAIN;
-    channel_cfg.reference = ADC_REFERENCE;
-    channel_cfg.acquisition_time = ADC_ACQUISITION_TIME;
-    channel_cfg.channel_id = channel;
-#if defined(CONFIG_BOARD_NRF52840DK_NRF52840)
-    channel_cfg.input_positive = NRF_SAADC_INPUT_AIN0 + channel; 
-#endif
+    // Get device tree configuration for this specific channel
+    const struct adc_channel_cfg *ch_cfg;
+    
+    if (channel == 0) {
+        // Use device tree configuration for channel 0
+        static const struct adc_channel_cfg ch0_cfg = 
+            ADC_CHANNEL_CFG_DT(DT_CHILD(DT_NODELABEL(adc), channel_0));
+        ch_cfg = &ch0_cfg;
+    } else if (channel == 1) {
+        // Use device tree configuration for channel 1  
+        static const struct adc_channel_cfg ch1_cfg = 
+            ADC_CHANNEL_CFG_DT(DT_CHILD(DT_NODELABEL(adc), channel_1));
+        ch_cfg = &ch1_cfg;
+    } else {
+        LOG_ERR("Invalid channel %d", channel);
+        return;
+    }
+    
+    // Setup channel with device tree configuration
+    int ret = adc_channel_setup(adc_dev, ch_cfg);
+    if (ret) {
+        LOG_ERR("ADC channel setup failed with error %d", ret);
+        return;
+    }
 
-    int ret = adc_channel_setup(adc_dev, &channel_cfg);
-	if (ret) {
-		LOG_ERR("ADC channel setup failed with error %d", ret);
-		return;
-	}
-
+    // Configure sequence
     sequence.channels = BIT(channel);
     sequence.buffer = &adc_sample_buffer;
     sequence.buffer_size = sizeof(adc_sample_buffer);
     sequence.resolution = ADC_RESOLUTION;
-	LOG_INF("ADC setup complete");
+    LOG_INF("ADC setup complete for channel %d", channel);
 }
 
 
@@ -114,9 +125,12 @@ static uint16_t read_adc_averaged(uint8_t n)
     for (uint8_t i = 0; i < n; i++) {
         if (adc_read(adc_dev, &sequence) == 0) {
             sum += adc_sample_buffer;
+            LOG_DBG("Sample %d: %d, Running sum: %d", i, adc_sample_buffer, sum);
         }
     }
-    return (uint16_t)(sum / n);
+    uint16_t average = (uint16_t)(sum / n);
+    LOG_INF("ADC Sum: %d, Samples: %d, Average: %d", sum, n, average);
+    return average;
 }
     /* TODO: Replace with actual ADC reading when CONFIG_ADC is enabled
     // For now, return simulated data
