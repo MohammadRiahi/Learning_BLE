@@ -21,8 +21,17 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/device.h>
+#include <C:\ncs\v2.6.1\modules\hal\nordic\nrfx\hal\nrf_saadc.h>
 
 #include "my_lbs.h"
+
+
+#define ADC_RESOLUTION 12
+#define ADC_GAIN ADC_GAIN_1
+#define ADC_REFERENCE ADC_REF_INTERNAL
+#define ADC_ACQUISITION_TIME ADC_ACQ_TIME_DEFAULT // you can change the acquisition time for higher accuracy
 
 LOG_MODULE_DECLARE(Lesson4_Exercise2);
 /* LOG_DBG("Bluetooth initialized\n"); */
@@ -30,7 +39,7 @@ LOG_MODULE_DECLARE(Lesson4_Exercise2);
 /* Forward declaration of the GATT service */
 extern const struct bt_gatt_service_static my_pbm_svc;
 // Sampling parameters 
-volatile uint8_t averaging  = 1;
+volatile uint8_t averaging = 1; //Set by the user on the app
 volatile uint32_t samplingRate = 2; // Hz
 
 /* Helper function to decode sample rate from code */
@@ -64,19 +73,60 @@ static struct k_work_delayable continuous_work;
 
 // ADC and data packet configuration
 #define DATAPACKET_SIZE 244
-#define SENSOR_PIN 0  // ADC channel to use
+#define SENSOR_PIN 1  // ADC channel to use
+
 
 // Simple ADC read function (placeholder until ADC is properly configured)
-static uint16_t read_adc_averaged(uint8_t pin, uint8_t n)
+
+static const struct device *adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
+static int16_t adc_sample_buffer;
+static struct adc_channel_cfg channel_cfg;
+static struct adc_sequence sequence;
+
+static void adc_setup(uint8_t channel)
 {
-    // TODO: Replace with actual ADC reading when CONFIG_ADC is enabled
+	
+    channel_cfg.gain = ADC_GAIN;
+    channel_cfg.reference = ADC_REFERENCE;
+    channel_cfg.acquisition_time = ADC_ACQUISITION_TIME;
+    channel_cfg.channel_id = channel;
+#if defined(CONFIG_BOARD_NRF52840DK_NRF52840)
+    channel_cfg.input_positive = NRF_SAADC_INPUT_AIN0 + channel; 
+#endif
+
+    int ret = adc_channel_setup(adc_dev, &channel_cfg);
+	if (ret) {
+		LOG_ERR("ADC channel setup failed with error %d", ret);
+		return;
+	}
+
+    sequence.channels = BIT(channel);
+    sequence.buffer = &adc_sample_buffer;
+    sequence.buffer_size = sizeof(adc_sample_buffer);
+    sequence.resolution = ADC_RESOLUTION;
+	LOG_INF("ADC setup complete");
+}
+
+
+static uint16_t read_adc_averaged(uint8_t n)
+{
+    int32_t sum = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        if (adc_read(adc_dev, &sequence) == 0) {
+            sum += adc_sample_buffer;
+        }
+    }
+    return (uint16_t)(sum / n);
+}
+    /* TODO: Replace with actual ADC reading when CONFIG_ADC is enabled
     // For now, return simulated data
     static uint16_t adc_value = 1000;
     adc_value += (k_uptime_get_32() % 40) - 20; // Add variation
     if (adc_value > 4095) adc_value = 4095;
     if (adc_value < 0) adc_value = 0;
     return adc_value;
-}
+	*/
+//}
 
 // Get timestamp function
 static uint64_t get_timestamp(void)
@@ -111,9 +161,15 @@ static void prepare_data_packet(uint8_t* data_packet)
 
     // Fill ADC values
     for (int i = 0; i < num_samples; i++) {
-        uint16_t adc_buffer = read_adc_averaged(SENSOR_PIN, averaging);
+        //adc_setup(1); // Ensure ADC is set up for channel 1
+		uint64_t start  = k_uptime_get();
+        uint16_t adc_buffer = read_adc_averaged(averaging);
         data_packet[8 + (i * 2)] = (adc_buffer >> 8) & 0xFF;
         data_packet[9 + (i * 2)] = adc_buffer & 0xFF;
+		uint64_t elapsed = k_uptime_get() - start;
+		if(elapsed<1){
+			k_msleep(1 - elapsed); // Ensure at least 1ms per sample for stability
+		}
     }
 }
 
@@ -372,6 +428,7 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 			break;
 		case CMD_START_SINGLE:
 			LOG_INF("Command: START_SINGLE");
+			//adc_setup(SENSOR_PIN); // set up the ADC
 			// Send a single data packet
 			if (notify_DATA_enabled) {
 				memset(data_buffer, 0, sizeof(data_buffer)); // filling the buffer with zeros
@@ -388,6 +445,7 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 			}
 			break;
 		case CMD_START_CONTINUOUS:
+			//adc_setup(SENSOR_PIN); // set up the ADC
 			LOG_INF("Command: START_CONTINUOUS");
 			start_continuous_measurement();
 			break;
@@ -471,6 +529,7 @@ int my_lbs_init(struct my_lbs_cb *callbacks)
 	}
 	
 	// Initialize continuous measurement work
+	adc_setup(SENSOR_PIN); // set up the ADC
 	k_work_init_delayable(&continuous_work, continuous_work_handler);
 	
 	LOG_INF("LBS service initialization completed");
