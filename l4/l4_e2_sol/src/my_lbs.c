@@ -23,8 +23,8 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/device.h>
-//#include <C:\ncs\v2.6.1\modules\hal\nordic\nrfx\hal\nrf_saadc.h>
-#include <C:\ncs\v3.0.2\zephyr\include\zephyr\dt-bindings\adc\nrf-saadc-v3.h>
+#include <C:\ncs\v2.6.1\modules\hal\nordic\nrfx\hal\nrf_saadc.h>
+//#include <C:\ncs\v3.0.2\zephyr\include\zephyr\dt-bindings\adc\nrf-saadc-v3.h>
 
 #include "my_lbs.h"
 
@@ -73,7 +73,7 @@ static struct k_work_delayable continuous_work;
 
 // ADC and data packet configuration
 #define DATAPACKET_SIZE 244
-#define SENSOR_PIN 1  // ADC channel to use
+#define SENSOR_PIN 0  // ADC channel to use
 
 
 // Simple ADC read function (placeholder until ADC is properly configured)
@@ -178,8 +178,10 @@ static void prepare_data_packet(uint8_t* data_packet)
         //adc_setup(1); // Ensure ADC is set up for channel 1
 		uint64_t start  = k_uptime_get();
         uint16_t adc_buffer = read_adc_averaged(averaging);
-        data_packet[8 + (i * 2)] = (adc_buffer >> 8) & 0xFF;
-        data_packet[9 + (i * 2)] = adc_buffer & 0xFF;
+		//uint16_t adc_buffer = 1000;
+		data_packet[8 + (i * 2)] = adc_buffer & 0xFF;
+        data_packet[9 + (i * 2)] = (adc_buffer >> 8) & 0xFF;
+        
 		uint64_t elapsed = k_uptime_get() - start;
 		if(elapsed<1){
 			k_msleep(1 - elapsed); // Ensure at least 1ms per sample for stability
