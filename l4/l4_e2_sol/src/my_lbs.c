@@ -27,17 +27,24 @@
 //#include <C:\ncs\v3.0.2\zephyr\include\zephyr\dt-bindings\adc\nrf-saadc-v3.h>
 
 #include "my_lbs.h"
-
-
+//-----------------------------Constants----------------------------------------------
+// ADC and data packet configuration
 #define ADC_RESOLUTION 12
 #define ADC_ACQUISITION_TIME ADC_ACQ_TIME_DEFAULT // you can change the acquisition time for higher accuracy
-// Note: gain and reference are now configured in app.overlay device tree
+#define SENSOR_PIN 0  // ADC channel to use
 
-LOG_MODULE_DECLARE(Lesson4_Exercise2);
-/* LOG_DBG("Bluetooth initialized\n"); */
+//Buffering 
+#define DATAPACKET_SIZE 244
+#define BUFFER_COUNT 2 // Double buffering 
+static char data_buffers[BUFFER_COUNT][DATAPACKET_SIZE];// 2 buffers of lengths DATAPACKET_SIZE
+static volatile byte  current_acquisition_buffer      = 0; // Buffer currently being filled
+static volatile byte  current_transmission_buffer     = 1; // Buffer currently being transmitted
+static volatile bool  buffer_ready_for_transmission   = false; // Flag to indicate buffer is ready
+static volatile bool  acquisition_in_progress         = false; // Flag to prevent overlapping acquisitions
 
 /* Forward declaration of the GATT service */
 extern const struct bt_gatt_service_static my_pbm_svc;
+
 // Sampling parameters 
 volatile uint8_t averaging = 1; //Set by the user on the app
 volatile uint32_t samplingRate = 2; // Hz
@@ -57,8 +64,6 @@ static uint32_t decodeSampleRate(uint8_t code) {
 
 static bool notify_DATA_enabled;
 static bool notify_MESSAGE_enabled;
-//static bool indicate_enabled;
-//static bool button_state;
 static struct my_lbs_cb lbs_cb;
 static uint8_t command_buffer[16]; // Buffer to store 16-byte commands
 static uint8_t heartbeat_buffer[8]; // Buffer for heartbeat value
@@ -70,11 +75,11 @@ uint8_t default_command[16] = {0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0
 // Simple continuous measurement variables
 static bool is_measuring = false;
 static struct k_work_delayable continuous_work;
+static struct k_work_delayable acquisition_work;
+static struct k_work_delayable transmission_work;
 
-// ADC and data packet configuration
-#define DATAPACKET_SIZE 244
-#define SENSOR_PIN 0  // ADC channel to use
-
+//-----------------------------Functions----------------------------------------------
+LOG_MODULE_DECLARE(Lesson4_Exercise2);
 
 // Simple ADC read function (placeholder until ADC is properly configured)
 
@@ -132,15 +137,7 @@ static uint16_t read_adc_averaged(uint8_t n)
     LOG_INF("ADC Sum: %d, Samples: %d, Average: %d", sum, n, average);
     return average;
 }
-    /* TODO: Replace with actual ADC reading when CONFIG_ADC is enabled
-    // For now, return simulated data
-    static uint16_t adc_value = 1000;
-    adc_value += (k_uptime_get_32() % 40) - 20; // Add variation
-    if (adc_value > 4095) adc_value = 4095;
-    if (adc_value < 0) adc_value = 0;
-    return adc_value;
-	*/
-//}
+
 
 // Get timestamp function
 static uint64_t get_timestamp(void)
@@ -148,9 +145,21 @@ static uint64_t get_timestamp(void)
     return k_uptime_get(); // System uptime in milliseconds
 }
 
+static void swap_buffers(void){
+	if (acquisition_in_progress){
+		return; //DO not swap during acquisition
+	}
+	uint8_t temp = current_acquisition_buffer;
+	current_acquisition_buffer = current_transmission_buffer;
+	current_transmission_buffer = temp;
+	LOG_DBG("Buffers swapped: acq=%d, trans=%d", 
+    	current_acquisition_buffer, current_transmission_buffer);
+}
+
 // Prepare data packet in the specified format
 static void prepare_data_packet(uint8_t* data_packet)
 {
+	acquisition_in_progress = true;
     // Include timestamp in the packet (6 bytes)
     uint64_t unix_time = get_timestamp();
     for (int i = 0; i < 6; i++) {
@@ -187,14 +196,8 @@ static void prepare_data_packet(uint8_t* data_packet)
 			k_msleep(1 - elapsed); // Ensure at least 1ms per sample for stability
 		}
     }
+	acquisition_in_progress = false;
 }
-
-/* STEP 4 - Define an indication parameter */
-//static struct bt_gatt_indicate_params ind_params;
-
-
-
-/* STEP 13 - Define the configuration change callback function for the MESSAGE characteristic */
 static void mylbsbc_ccc_message_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	notify_MESSAGE_enabled = (value == BT_GATT_CCC_NOTIFY);
@@ -202,7 +205,7 @@ static void mylbsbc_ccc_message_cfg_changed(const struct bt_gatt_attr *attr, uin
 		notify_MESSAGE_enabled ? "enabled" : "disabled");
 }
 
-/* STEP 13 - Define the configuration change callback function for the MYSENSOR characteristic */
+
 static void mylbsbc_ccc_DATA_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	notify_DATA_enabled = (value == BT_GATT_CCC_NOTIFY);
@@ -210,6 +213,41 @@ static void mylbsbc_ccc_DATA_cfg_changed(const struct bt_gatt_attr *attr, uint16
 		notify_DATA_enabled ? "enabled" : "disabled");
 }
 
+// Acquisition work handler
+static void acquisition_work_handler(struct k_work *work)
+{
+	if (!is_measuring) return;
+	
+	// reset the current acquisition buffer
+	memset(data_buffers[current_acquisition_buffer],0,DATAPACKET_SIZE);
+	prepare_data_packet((uint8_t*)data_buffers[current_acquisition_buffer]);
+	buffer_ready_for_transmission = true;
+	k_work_reschedule(&transmission_work, K_NO_WAIT); // Schedule next acquisition immediately
+	// Schedule next acquisition based on sampling rate
+	uint32_t interval_ms = 1000 / samplingRate;
+	if (interval_ms < 20) interval_ms = 20;
+    k_work_reschedule(&acquisition_work, K_NO_WAIT);
+
+}
+
+// Transmission work handler
+static void transmission_work_handler(struct k_work *work){
+ if (!is_measuring || !notify_DATA_enabled || !buffer_ready_for_transmission){
+		return;
+	}
+	int result = my_lbs_send_sensor_notify(data_buffers[current_transmission_buffer]);
+	if (result == 0){
+		LOG_DBG("Sent data packet from buffer %d", current_transmission_buffer);
+		swap_buffers();
+		buffer_ready_for_transmission = false;
+	} else if (result == -ENOMEM) {
+        LOG_WRN("BLE buffers full, retrying in 10ms");
+        k_work_reschedule(&transmission_work, K_MSEC(10));
+    } else {
+        LOG_ERR("Failed to send data packet: %d", result);
+        buffer_ready_for_transmission = false;
+    }
+}
 // Simple continuous measurement functions
 static void continuous_work_handler(struct k_work *work)
 {
@@ -247,14 +285,20 @@ static void start_continuous_measurement(void)
 	}
 	
 	is_measuring = true;
-	LOG_INF("Starting continuous measurement at %d Hz", samplingRate);
-	k_work_schedule(&continuous_work, K_NO_WAIT);
+	buffer_ready_for_transmission = false;
+	current_acquisition_buffer = 0;
+	current_transmission_buffer = 1;
+	LOG_INF("Starting double-buffered measurement at %d Hz", samplingRate);
+	k_work_schedule(&acquisition_work, K_NO_WAIT);
 }
 
 static void stop_continuous_measurement(void)
 {
 	is_measuring = false;
-	k_work_cancel_delayable(&continuous_work);
+	buffer_ready_for_transmission = false;
+	k_work_cancel_delayable(&acquisition_work);
+	k_work_cancel_delayable(&transmission_work);
+	//k_work_cancel_delayable(&continuous_work);
 	LOG_INF("Stopped continuous measurement");
 }
 
@@ -524,7 +568,6 @@ BT_GATT_SERVICE_DEFINE(
 int my_lbs_init(struct my_lbs_cb *callbacks)
 {
 	LOG_INF("LBS service initialization started");
-	
 	// Initialize command buffer with default command
 	memcpy(command_buffer, default_command, 16);
 	LOG_INF("Command buffer initialized with default command");
@@ -539,20 +582,27 @@ int my_lbs_init(struct my_lbs_cb *callbacks)
 			(void*)my_pbm_svc.attrs[i].write);
 	}
 	
-	if (callbacks) {
+	/*if (callbacks) {
 		lbs_cb.led_cb = callbacks->led_cb;
 		lbs_cb.button_cb = callbacks->button_cb;
 	}
+		*/
 	
 	// Initialize continuous measurement work
 	adc_setup(SENSOR_PIN); // set up the ADC
-	k_work_init_delayable(&continuous_work, continuous_work_handler);
-	
+	k_work_init_delayable(&acquisition_work, acquisition_work_handler);
+	k_work_init_delayable(&transmission_work, transmission_work_handler);
+	//k_work_init_delayable(&continuous_work, continuous_work_handler);
+	static volatile byte  current_acquisition_buffer      = 0; // Buffer currently being filled
+	static volatile byte  current_transmission_buffer     = 1; // Buffer currently being transmitted
+	static volatile bool  buffer_ready_for_transmission   = false; // Flag to indicate buffer is ready
+	static volatile bool  acquisition_in_progress         = false; // Flag to prevent overlapping acquisitions
+
 	LOG_INF("LBS service initialization completed");
 	return 0;
 }
-
-/* STEP 5 - Define the function to send indications 
+/*
+ 
 int my_lbs_send_button_state_indicate(bool button_state)
 {
 	if (!indicate_enabled) {
@@ -566,7 +616,7 @@ int my_lbs_send_button_state_indicate(bool button_state)
 	return bt_gatt_indicate(NULL, &ind_params);
 }
 */
-/* STEP 14 - Define the function to send notifications for the MYSENSOR characteristic */
+
 int my_lbs_send_sensor_notify(uint32_t sensor_value)
 {
 	if (!notify_DATA_enabled) {
