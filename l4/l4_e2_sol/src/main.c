@@ -11,7 +11,9 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/conn.h>
 #include <dk_buttons_and_leds.h>
+#include <zephyr/drivers/gpio.h>
 #include "my_lbs.h"
+
 
 static const struct bt_le_adv_param *adv_param = BT_LE_ADV_PARAM(
 	(BT_LE_ADV_OPT_CONNECTABLE |
@@ -34,11 +36,13 @@ LOG_MODULE_REGISTER(Lesson4_Exercise2, LOG_LEVEL_DBG);
 #define PRIORITY 7
 
 #define RUN_LED_BLINK_INTERVAL 500
-/* STEP 17 - Define the interval at which you want to send data at */
 #define NOTIFY_INTERVAL 500
+#define MEASURE_PIN 3 // gpio used for adc timer verification 
+const struct device *gpio_dev;
+
 static bool app_button_state;
 static struct k_work adv_work;
-/* STEP 15 - Define the data you want to stream over Bluetooth LE */
+
 static uint32_t app_sensor_value = 100;
 
 static const struct bt_data ad[] = {
@@ -93,7 +97,7 @@ void send_data_thread(void)
 		/* Simulate data */
 		simulate_data();
 		/* Send notification, the function sends notifications only if a client is subscribed */
-		my_lbs_send_sensor_notify(app_sensor_value);
+		//my_lbs_send_sensor_notify(app_sensor_value);
 
 		k_sleep(K_MSEC(NOTIFY_INTERVAL));
 	}

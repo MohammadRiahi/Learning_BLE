@@ -23,6 +23,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
 #include <C:\ncs\v2.6.1\modules\hal\nordic\nrfx\hal\nrf_saadc.h>
 //#include <C:\ncs\v3.0.2\zephyr\include\zephyr\dt-bindings\adc\nrf-saadc-v3.h>
 
@@ -32,22 +33,25 @@
 #define ADC_RESOLUTION 12
 #define ADC_ACQUISITION_TIME ADC_ACQ_TIME_DEFAULT // you can change the acquisition time for higher accuracy
 #define SENSOR_PIN 0  // ADC channel to use
+#define MEASURE_PIN 3 // gpio used for adc timer verification 
+extern const struct device *gpio_dev;
 
 //Buffering 
 #define DATAPACKET_SIZE 244
 #define BUFFER_COUNT 2 // Double buffering 
-static char data_buffers[BUFFER_COUNT][DATAPACKET_SIZE];// 2 buffers of lengths DATAPACKET_SIZE
-static volatile byte  current_acquisition_buffer      = 0; // Buffer currently being filled
-static volatile byte  current_transmission_buffer     = 1; // Buffer currently being transmitted
-static volatile bool  buffer_ready_for_transmission   = false; // Flag to indicate buffer is ready
-static volatile bool  acquisition_in_progress         = false; // Flag to prevent overlapping acquisitions
+#define RING_SIZE 512  // Must be power of 2 for efficiency
+#define RING_MASK (RING_SIZE-1)  // For fast modulo operations
+#define SAMPLES_PER_PACKET 118  // Based on (244-8)/2 = 118 samples per packet
+static uint16_t adc_ring_buffer[RING_SIZE]; // Ring buffer for ADC samples
+static volatile uint32_t ring_write_idx = 0;
+static volatile uint32_t ring_read_idx = 0;
 
 /* Forward declaration of the GATT service */
 extern const struct bt_gatt_service_static my_pbm_svc;
 
 // Sampling parameters 
 volatile uint8_t averaging = 1; //Set by the user on the app
-volatile uint32_t samplingRate = 2; // Hz
+volatile uint32_t samplingRate = 1000; // Hz
 
 /* Helper function to decode sample rate from code */
 static uint32_t decodeSampleRate(uint8_t code) {
@@ -74,10 +78,18 @@ uint8_t default_command[16] = {0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0
 
 // Simple continuous measurement variables
 static bool is_measuring = false;
-static struct k_work_delayable continuous_work;
-static struct k_work_delayable acquisition_work;
-static struct k_work_delayable transmission_work;
-
+//static struct k_work_delayable continuous_work;
+//static struct k_work_delayable acquisition_work;
+//static struct k_work_delayable transmission_work;
+static struct k_work adc_work;
+static struct k_work packet_work;
+static struct k_timer adc_timer; // 1 ms Timer constants and definitions -  holds information such as callbacks, period etc. 
+static void   adc_timer_handler(struct k_timer *timer); /*forward declaration means this function exists but wil be defined later the "timer" parameter is the timer object that triggers the callback*/
+static void   adc_work_handler(struct k_work *work);
+static void   packet_work_handler(struct k_work *work);
+static void   prepare_packet_header(uint8_t* packet);	
+static uint64_t get_timestamp(void);
+static void adc_setup(uint8_t channel);
 //-----------------------------Functions----------------------------------------------
 LOG_MODULE_DECLARE(Lesson4_Exercise2);
 
@@ -88,6 +100,136 @@ static int16_t adc_sample_buffer;
 static struct adc_channel_cfg channel_cfg;
 static struct adc_sequence sequence;
 
+//----------------Ring Buffer Management Functions--------------------
+static inline bool ring_buffer_put(uint16_t sample)
+{
+	gpio_pin_toggle(gpio_dev, MEASURE_PIN); // Start measurement timing
+	uint32_t next_write  = (ring_write_idx + 1) & RING_MASK;	
+	if (next_write == ring_read_idx) {
+		// Buffer is full
+		return false;
+	}
+	adc_ring_buffer[ring_write_idx] = sample;	
+	ring_write_idx = next_write;
+
+	return true;
+}
+
+static inline bool ring_buffer_get(uint16_t *sample){
+	if (ring_read_idx == ring_write_idx) {
+		// Buffer is empty
+		return false;
+	}
+	*sample = adc_ring_buffer[ring_read_idx];
+	ring_read_idx = (ring_read_idx + 1) & RING_MASK;
+	return true;
+}
+static inline uint32_t ring_buffer_count(void){
+	return (ring_write_idx - ring_read_idx) & RING_MASK;
+}
+static inline bool ring_buffer_is_full(void){
+	return ((ring_write_idx + 1) & RING_MASK) == ring_read_idx;
+}
+static inline bool ring_buffer_is_empty(void){
+	return ring_write_idx == ring_read_idx;
+}
+static void ring_buffer_reset(void){
+	ring_write_idx = 0;
+	ring_read_idx = 0;
+}
+
+static uint16_t read_adc_single(void){
+
+	if (adc_read(adc_dev, &sequence) == 0) {
+		return adc_sample_buffer;
+	} else {
+		LOG_ERR("ADC read failed");
+		return 0; // Return 0 on failure
+	}
+}
+static void adc_timer_handler(struct k_timer *timer){
+	if(!k_work_is_pending(&adc_work)){
+		k_work_submit(&adc_work);
+	}
+}
+
+static void adc_work_handler(struct k_work*work)
+{
+	if (!is_measuring) return;
+	//gpio_pin_set(gpio_dev,MEASURE_PIN,1); // Set pin high to indicate measurement start
+	uint16_t sample = read_adc_single();
+	//gpio_pin_set(gpio_dev, MEASURE_PIN, 0);
+
+	if (!ring_buffer_put(sample)){ // put the sample in the ring buffer
+		LOG_WRN("Ring buffer full, sample lost");
+	}
+
+	if (ring_buffer_count() >= SAMPLES_PER_PACKET){
+		if (!k_work_is_pending(&packet_work)){
+			k_work_submit(&packet_work);
+		}
+	}
+}
+static void packet_work_handler(struct k_work*work)
+{
+	if (!is_measuring) return;
+	if(ring_buffer_count() < SAMPLES_PER_PACKET) return;
+
+	uint8_t packet[DATAPACKET_SIZE];
+	memset(packet, 0, DATAPACKET_SIZE); //reset the packet buffer
+
+	prepare_packet_header(packet);
+
+	// Fill the packet with the samples from the ring buffer 
+	for (int i = 0; i < SAMPLES_PER_PACKET; i++) {
+		uint16_t sample;
+		if (ring_buffer_get(&sample)) {
+			packet[8 + (i * 2)] = sample & 0xFF;
+			packet[9 + (i * 2)] = (sample >> 8) & 0xFF;
+		} else {	
+			LOG_ERR("Unexpected ring buffer underflow");
+			break;
+		}
+	}
+	// Send the packet through notification
+	if (notify_DATA_enabled) {
+		int err = my_lbs_send_sensor_notify( packet);
+		if (err) {
+			LOG_ERR("Notify DATA failed (err %d)", err);
+		}  else if(err == -ENOMEM){
+			LOG_WRN("BLE buffer full, packet dropped");
+		}
+		else if (err == 0) {
+			LOG_DBG("Notify DATA sent");
+		}
+		else {
+			LOG_WRN("DATA notifications not enabled");
+		}
+	}
+}
+	static void prepare_packet_header(uint8_t* packet){
+	// Data format configuration
+	 // Include timestamp in the packet (6 bytes)
+    uint64_t unix_time = get_timestamp();
+    for (int i = 0; i < 6; i++) {
+        packet[i] = (unix_time >> (i * 8)) & 0xFF;
+    }
+	
+    const uint8_t num_channels = 1;
+    const uint8_t precision = 1;
+    const uint8_t channel_index = (1 << 0) << 4;
+    uint8_t bytes_per_sample = precision + 1;
+    uint8_t encoded_num_channels = num_channels - 1;
+
+    uint8_t data_format = (encoded_num_channels & 0x03)
+        | ((precision & 0x03) << 2)
+        | (channel_index & 0xF0);
+
+    packet[6] = data_format; // for debugging purposes we could put a counter here to track any dropped packets
+    packet[7] =  (DATAPACKET_SIZE - 8) / (num_channels * bytes_per_sample);  // Number of samples in packet
+	}
+	
+// ADC setup function
 static void adc_setup(uint8_t channel)
 {
     // Get device tree configuration for this specific channel
@@ -123,6 +265,37 @@ static void adc_setup(uint8_t channel)
     LOG_INF("ADC setup complete for channel %d", channel);
 }
 
+	static void start_timer_sampling(uint32_t frequency_hz){
+		ring_buffer_reset();
+		// calculate timer period 
+		uint32_t period_us  = 1000000 / frequency_hz;
+		k_timer_start(&adc_timer,K_USEC(period_us),K_USEC(period_us)); // the timer fires for the first time after 1 ms (second parameter) and then it keeps firing every 1 ms (third parameter)
+		is_measuring = true;
+		LOG_INF("Started timer sampling at %d Hz (%d μs period)",frequency_hz, period_us);
+}
+	static void stop_timer_sampling(void){
+		k_timer_stop(&adc_timer);
+		k_work_cancel(&adc_work);
+		k_work_cancel(&packet_work);
+		is_measuring = false;
+		LOG_INF("Stopped timer sampling");
+	}
+
+	static void start_continuous_measurement_timer(void){
+    if (is_measuring) {
+        LOG_WRN("Already measuring");
+        return;
+    }
+    
+    LOG_INF("Starting timer-based measurement at %d Hz", samplingRate);
+    start_timer_sampling(samplingRate);
+}
+
+	static void stop_continuous_measurement_timer(void){
+    LOG_INF("Stopping timer-based measurement");
+    stop_timer_sampling();
+}
+
 
 static uint16_t read_adc_averaged(uint8_t n)
 {
@@ -145,20 +318,11 @@ static uint64_t get_timestamp(void)
     return k_uptime_get(); // System uptime in milliseconds
 }
 
-static void swap_buffers(void){
-	if (acquisition_in_progress){
-		return; //DO not swap during acquisition
-	}
-	uint8_t temp = current_acquisition_buffer;
-	current_acquisition_buffer = current_transmission_buffer;
-	current_transmission_buffer = temp;
-	LOG_DBG("Buffers swapped: acq=%d, trans=%d", 
-    	current_acquisition_buffer, current_transmission_buffer);
-}
 
 // Prepare data packet in the specified format
 static void prepare_data_packet(uint8_t* data_packet)
 {
+	/*
 	acquisition_in_progress = true;
     // Include timestamp in the packet (6 bytes)
     uint64_t unix_time = get_timestamp();
@@ -197,6 +361,7 @@ static void prepare_data_packet(uint8_t* data_packet)
 		}
     }
 	acquisition_in_progress = false;
+	*/
 }
 static void mylbsbc_ccc_message_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
@@ -216,6 +381,7 @@ static void mylbsbc_ccc_DATA_cfg_changed(const struct bt_gatt_attr *attr, uint16
 // Acquisition work handler
 static void acquisition_work_handler(struct k_work *work)
 {
+	/*1
 	if (!is_measuring) return;
 	
 	// reset the current acquisition buffer
@@ -227,11 +393,12 @@ static void acquisition_work_handler(struct k_work *work)
 	uint32_t interval_ms = 1000 / samplingRate;
 	if (interval_ms < 20) interval_ms = 20;
     k_work_reschedule(&acquisition_work, K_NO_WAIT);
-
+	*/
 }
 
 // Transmission work handler
 static void transmission_work_handler(struct k_work *work){
+	/*
  if (!is_measuring || !notify_DATA_enabled || !buffer_ready_for_transmission){
 		return;
 	}
@@ -247,10 +414,14 @@ static void transmission_work_handler(struct k_work *work){
         LOG_ERR("Failed to send data packet: %d", result);
         buffer_ready_for_transmission = false;
     }
+		*/
 }
+	
+
 // Simple continuous measurement functions
 static void continuous_work_handler(struct k_work *work)
 {
+	/*
 	if (!is_measuring || !notify_DATA_enabled) {
 		return;
 	}
@@ -275,10 +446,12 @@ static void continuous_work_handler(struct k_work *work)
 	uint32_t interval_ms = 1000 / samplingRate;
 	if (interval_ms < 50) interval_ms = 50; // Minimum 50ms for large packets
 	k_work_reschedule(&continuous_work, K_MSEC(interval_ms));
+	*/
 }
 
 static void start_continuous_measurement(void)
 {
+	/*
 	if (is_measuring) {
 		LOG_WRN("Already measuring");
 		return;
@@ -290,16 +463,19 @@ static void start_continuous_measurement(void)
 	current_transmission_buffer = 1;
 	LOG_INF("Starting double-buffered measurement at %d Hz", samplingRate);
 	k_work_schedule(&acquisition_work, K_NO_WAIT);
+	*/
 }
 
 static void stop_continuous_measurement(void)
 {
+	/*
 	is_measuring = false;
 	buffer_ready_for_transmission = false;
 	k_work_cancel_delayable(&acquisition_work);
 	k_work_cancel_delayable(&transmission_work);
 	//k_work_cancel_delayable(&continuous_work);
 	LOG_INF("Stopped continuous measurement");
+	*/
 }
 
 static ssize_t write_heartbeat(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
@@ -368,7 +544,8 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 			LOG_INF("Command: STOP_ALL");
 			// Handle stop all command
 			LOG_INF("Command: STOP_MEASUREMENT");
-			stop_continuous_measurement();
+			stop_continuous_measurement_timer(); //stop_continuous_measurement();
+			
 			break;
 			
 		case CMD_BATTERY_CHECK:
@@ -507,7 +684,7 @@ static ssize_t write_commands(struct bt_conn *conn, const struct bt_gatt_attr *a
 		case CMD_START_CONTINUOUS:
 			//adc_setup(SENSOR_PIN); // set up the ADC
 			LOG_INF("Command: START_CONTINUOUS");
-			start_continuous_measurement();
+			start_continuous_measurement_timer();
 			break;
 			
 		default:
@@ -536,7 +713,11 @@ static ssize_t read_commands(struct bt_conn *conn, const struct bt_gatt_attr *at
 	// Return the content of command_buffer (16 bytes)
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, command_data, 16);
 }
+// -------------------------------Timer configuration--------------------------------- 
 
+
+
+// -------------------------------BLE related coedde---------------------------------
 /* PIBiomed (PBM)  Service Declaration */
 BT_GATT_SERVICE_DEFINE(
 	my_pbm_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_PBM),
@@ -559,11 +740,6 @@ BT_GATT_SERVICE_DEFINE(
 	BT_GATT_CUD("HEARTBEAT", BT_GATT_PERM_READ),
 );
 
-/* Advertising Service Declaration - No characteristics, just service UUID 
-BT_GATT_SERVICE_DEFINE(
-	my_advertising_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_PBM_ADVERTISING),
-);
-*/
 /* A function to register application callbacks for the LED and Button characteristics  */
 int my_lbs_init(struct my_lbs_cb *callbacks)
 {
@@ -571,33 +747,45 @@ int my_lbs_init(struct my_lbs_cb *callbacks)
 	// Initialize command buffer with default command
 	memcpy(command_buffer, default_command, 16);
 	LOG_INF("Command buffer initialized with default command");
-	
-	LOG_INF("Service has %d attributes", my_pbm_svc.attr_count);
-	
-	// Print all attributes to verify service structure
-	for (int i = 0; i < my_pbm_svc.attr_count; i++) {
-		LOG_INF("Attr[%d]: UUID type %d, read=%p, write=%p", 
-			i, my_pbm_svc.attrs[i].uuid->type, 
-			(void*)my_pbm_svc.attrs[i].read, 
-			(void*)my_pbm_svc.attrs[i].write);
+	// Initialize GPIO for measurement (optional)
+	gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+	if (gpio_dev) {
+		gpio_pin_configure(gpio_dev, MEASURE_PIN, GPIO_OUTPUT_ACTIVE);
 	}
-	
+
+	// Initialize ring buffer work items
+	k_work_init(&adc_work,    adc_work_handler);
+	k_work_init(&packet_work, packet_work_handler);
+
+	// Initialize ring buffer
+	ring_buffer_reset();
+
 	/*if (callbacks) {
 		lbs_cb.led_cb = callbacks->led_cb;
 		lbs_cb.button_cb = callbacks->button_cb;
 	}
 		*/
 	
-	// Initialize continuous measurement work
+	// Initialize functions needed for mcu operation 
 	adc_setup(SENSOR_PIN); // set up the ADC
-	k_work_init_delayable(&acquisition_work, acquisition_work_handler);
+	k_timer_init(&adc_timer, adc_timer_handler, NULL);
+	/*k_work_init_delayable(&acquisition_work, acquisition_work_handler);
 	k_work_init_delayable(&transmission_work, transmission_work_handler);
-	//k_work_init_delayable(&continuous_work, continuous_work_handler);
+	k_work_init_delayable(&continuous_work, continuous_work_handler);
 	static volatile byte  current_acquisition_buffer      = 0; // Buffer currently being filled
 	static volatile byte  current_transmission_buffer     = 1; // Buffer currently being transmitted
 	static volatile bool  buffer_ready_for_transmission   = false; // Flag to indicate buffer is ready
 	static volatile bool  acquisition_in_progress         = false; // Flag to prevent overlapping acquisitions
+	*/
 
+// Print all attributes to verify service structure
+	LOG_INF("Service has %d attributes", my_pbm_svc.attr_count);
+	for (int i = 0; i < my_pbm_svc.attr_count; i++) {
+		LOG_INF("Attr[%d]: UUID type %d, read=%p, write=%p", 
+			i, my_pbm_svc.attrs[i].uuid->type, 
+			(void*)my_pbm_svc.attrs[i].read, 
+			(void*)my_pbm_svc.attrs[i].write);
+	}
 	LOG_INF("LBS service initialization completed");
 	return 0;
 }
@@ -617,24 +805,25 @@ int my_lbs_send_button_state_indicate(bool button_state)
 }
 */
 
-int my_lbs_send_sensor_notify(uint32_t sensor_value)
+int my_lbs_send_sensor_notify(uint8_t *sensor_value)
 {
 	if (!notify_DATA_enabled) {
 		return -EACCES;
 	}
 
-	// The DATA characteristic value attribute is at index 4:
-	// [0] Primary Service
-	// [1] COMMAND Characteristic Declaration
-	// [2] COMMAND Characteristic Value
-	// [3] COMMAND CUD Descriptor
-	// [4] DATA Characteristic Declaration
-	// [5] DATA Characteristic Value
-	// [6] DATA CUD Descriptor
-	// [7] DATA CCC Descriptor
-	// [8] MESSAGE Characteristic Declaration
-	// [9] MESSAGE Characteristic Value
-	// [10] MESSAGE CUD Descriptor
-	// [11] MESSAGE CCC Descriptor
-	return bt_gatt_notify(NULL, &my_pbm_svc.attrs[5], &sensor_value, sizeof(sensor_value));
+	return bt_gatt_notify(NULL, &my_pbm_svc.attrs[5], sensor_value, DATAPACKET_SIZE);
 }
+
+/*You could also use a macro to perform the notify action when the array name is passed directly into the function - 
+this way you don't have to specify the size of the array manually each time you call the function 
+when you pass any array into a function C treats the array name as a pointer to the first element, so sizeof(array_name) will give you the size of the pointer, not the array itself
+so I do not want to use a macro function because it complicates the code and rather I want to pass the constant for the size of the array
+If I wanted to make the code more dynamic I would use the macro or pass the size of the array as the second parameter but to keep things simpler I will just use the constant defined at the top of the file
+*/
+
+/* Macro that automatically uses sizeof() on the passed array
+#define my_lbs_send_sensor_notify(data_array) \
+	(notify_DATA_enabled ? \
+		bt_gatt_notify(NULL, &my_pbm_svc.attrs[5], data_array, sizeof(data_array)) : \
+		-EACCES)
+		*/
